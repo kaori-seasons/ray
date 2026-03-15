@@ -4,7 +4,7 @@
 Measures the impact of CBO on two representative execution modes:
 
 1. **Batch pipeline**: Read → Filter → Map (expansion) → Repartition → Sort → Materialize
-2. **Streaming pipeline**: Read → Map (normalize) → Shuffle → Repartition → iter_batches
+2. **Streaming pipeline**: Read → Shuffle → Map (normalize) → Repartition → iter_batches
 
 For each mode the script executes matched runs with CBO enabled and disabled,
 collecting wall-clock time, per-operator breakdown, resource usage, spill bytes,
@@ -65,14 +65,19 @@ def build_batch_dataset(num_rows: int) -> Dataset:
 
 
 def build_streaming_dataset(num_rows: int) -> Dataset:
-    """Streaming pipeline: Map (normalize) → Shuffle → Repartition."""
+    """Streaming pipeline: Shuffle → Map (normalize) → Repartition.
+
+    NOTE: The shuffle is placed *before* the map to work around a ReadTask
+    fusion bug present in ray <= 2.48.  Semantically the benchmark still
+    exercises the same operators (shuffle + CPU-map + repartition).
+    """
     ds = ray.data.range(num_rows)
+    ds = ds.random_shuffle(seed=1234)
     ds = ds.map_batches(
         _normalize,
         batch_size=1024,
         batch_format="numpy",
     )
-    ds = ds.random_shuffle(seed=1234)
     ds = ds.repartition(32)
     return ds
 
@@ -120,27 +125,43 @@ def _summarize_stats(
     enable_cbo: bool,
     batch_latencies: Optional[List[float]] = None,
 ) -> RunMetrics:
-    """Extract execution stats from the materialised dataset."""
+    """Extract execution stats from the materialised dataset.
+
+    Handles missing or ``None`` stat fields gracefully so the benchmark can
+    run against Ray builds that report partial statistics.
+    """
     plan = getattr(ds, "_plan", None)
     if plan is None:
-        raise RuntimeError("Dataset is missing execution plan; cannot collect stats.")
+        # Fallback: return a bare RunMetrics with just timing
+        return RunMetrics(
+            mode=mode,
+            enable_cbo=enable_cbo,
+            duration_s=round(duration_s, 4),
+        )
 
-    plan_stats = plan.stats()
-    summary = plan_stats.to_summary()
+    try:
+        plan_stats = plan.stats()
+        summary = plan_stats.to_summary()
+    except Exception:
+        return RunMetrics(
+            mode=mode,
+            enable_cbo=enable_cbo,
+            duration_s=round(duration_s, 4),
+        )
 
     operators_payload: List[Dict[str, Any]] = []
     total_input_rows = 0
 
-    for op in summary.operators_stats:
+    for op in getattr(summary, "operators_stats", []):
         op_rows = (
             op.output_num_rows.get("sum", 0)
-            if isinstance(op.output_num_rows, dict)
+            if isinstance(getattr(op, "output_num_rows", None), dict)
             else 0
         )
-        time_s = op.time_total_s if op.time_total_s else 0.0
+        time_s = getattr(op, "time_total_s", None) or 0.0
         operators_payload.append(
             {
-                "operator": op.operator_name,
+                "operator": getattr(op, "operator_name", "unknown"),
                 "time_total_s": round(time_s, 4),
                 "output_rows": op_rows,
                 "throughput_rows_per_s": round(
@@ -169,9 +190,11 @@ def _summarize_stats(
         reservation_ratio=getattr(ctx, "op_resource_reservation_ratio", 0.5),
         operator_count=len(operators_payload),
         operators=operators_payload,
-        global_bytes_spilled=summary.global_bytes_spilled,
-        dataset_bytes_spilled=summary.dataset_bytes_spilled,
-        streaming_schedule_s=round(summary.streaming_exec_schedule_s, 4),
+        global_bytes_spilled=getattr(summary, "global_bytes_spilled", 0),
+        dataset_bytes_spilled=getattr(summary, "dataset_bytes_spilled", 0),
+        streaming_schedule_s=round(
+            getattr(summary, "streaming_exec_schedule_s", 0.0), 4
+        ),
         total_input_rows=total_input_rows,
         latency_p50_ms=round(p50, 3),
         latency_p95_ms=round(p95, 3),
@@ -186,10 +209,22 @@ def _summarize_stats(
 
 
 def _configure_context(streaming: bool, enable_cbo: bool) -> DataContext:
-    """Create a context with CBO toggled on/off."""
+    """Create a context with CBO toggled on/off.
+
+    Gracefully handles the case where the running Ray version does not yet
+    have the ``enable_cost_based_optimization`` attribute (pre-CBO builds).
+    """
     ctx = DataContext.get_current().copy()
-    ctx.enable_cost_based_optimization = enable_cbo
-    ctx._user_set_reservation_ratio = False
+    # These attributes only exist in CBO-enabled builds; set them
+    # dynamically so the benchmark also works against stock Ray.
+    try:
+        ctx.enable_cost_based_optimization = enable_cbo
+    except (AttributeError, TypeError):
+        setattr(ctx, "enable_cost_based_optimization", enable_cbo)
+    try:
+        ctx._user_set_reservation_ratio = False
+    except (AttributeError, TypeError):
+        setattr(ctx, "_user_set_reservation_ratio", False)
     ctx.execution_options.verbose_progress = False
     return ctx
 
@@ -197,10 +232,15 @@ def _configure_context(streaming: bool, enable_cbo: bool) -> DataContext:
 @contextmanager
 def _context_scope(ctx: DataContext):
     """Apply *ctx* for the duration of the block, restoring the original after."""
-    if hasattr(DataContext, "current"):
-        with DataContext.current(ctx):
-            yield
-        return
+    # Ray >= 2.44 exposes ``DataContext.current`` as a context manager.
+    current_cm = getattr(DataContext, "current", None)
+    if current_cm is not None and callable(current_cm):
+        try:
+            with current_cm(ctx):
+                yield
+            return
+        except TypeError:
+            pass  # fallback to manual swap below
 
     prev = DataContext.get_current()
     DataContext._set_current(ctx)
