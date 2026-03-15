@@ -12,25 +12,10 @@ Ray Data CBO Phase 4: 反馈应用规则
 from typing import List, Type, Any, Optional
 import logging
 
+from ray.data._internal.logical.interfaces.optimizer import Rule
+from ray.data._internal.logical.interfaces.plan import Plan
+
 logger = logging.getLogger(__name__)
-
-
-class Rule:
-    """优化规则的基类接口"""
-
-    def apply(self, plan: Any) -> Any:
-        """应用规则到执行计划"""
-        raise NotImplementedError
-
-    @classmethod
-    def dependencies(cls) -> List[Type["Rule"]]:
-        """返回该规则依赖的前置规则"""
-        return []
-
-    @classmethod
-    def dependents(cls) -> List[Type["Rule"]]:
-        """返回依赖该规则的后置规则"""
-        return []
 
 
 class ApplyRuntimeFeedbackRule(Rule):
@@ -64,9 +49,11 @@ class ApplyRuntimeFeedbackRule(Rule):
         原因：这是最后一个优化规则，应该在所有其他优化完成后
         才应用反馈，确保反馈基于最终的计划结构。
         """
-        return []  # 在实际实现中应导入 JoinReorderRule
+        from ray.data._internal.logical.rules.join_reorder_rule import JoinReorderRule
 
-    def apply(self, plan: Any) -> Any:
+        return [JoinReorderRule]
+
+    def apply(self, plan: Plan) -> Plan:
         """
         应用规则到物理计划
 

@@ -13,25 +13,10 @@ Ray Data CBO Phase 3: Join重排序规则
 from typing import List, Type, Any, Optional
 import logging
 
+from ray.data._internal.logical.interfaces.optimizer import Rule
+from ray.data._internal.logical.interfaces.plan import Plan
+
 logger = logging.getLogger(__name__)
-
-
-class Rule:
-    """优化规则的基类接口"""
-
-    def apply(self, plan: Any) -> Any:
-        """应用规则到执行计划"""
-        raise NotImplementedError
-
-    @classmethod
-    def dependencies(cls) -> List[Type["Rule"]]:
-        """返回该规则依赖的前置规则"""
-        return []
-
-    @classmethod
-    def dependents(cls) -> List[Type["Rule"]]:
-        """返回依赖该规则的后置规则"""
-        return []
 
 
 class JoinReorderRule(Rule):
@@ -73,9 +58,13 @@ class JoinReorderRule(Rule):
         原因：分区数可能影响内存计算，
         应该先推导分区数。
         """
-        return []  # 在实际实现中应导入 DeriveShufflePartitionsRule
+        from ray.data._internal.logical.rules.derive_shuffle_partitions_rule import (
+            DeriveShufflePartitionsRule,
+        )
 
-    def apply(self, plan: Any) -> Any:
+        return [DeriveShufflePartitionsRule]
+
+    def apply(self, plan: Plan) -> Plan:
         """
         应用规则到物理计划
 

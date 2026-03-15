@@ -14,25 +14,10 @@ from typing import List, Type, Any, Optional
 import logging
 import math
 
+from ray.data._internal.logical.interfaces.optimizer import Rule
+from ray.data._internal.logical.interfaces.plan import Plan
+
 logger = logging.getLogger(__name__)
-
-
-class Rule:
-    """优化规则的基类接口"""
-
-    def apply(self, plan: Any) -> Any:
-        """应用规则到执行计划"""
-        raise NotImplementedError
-
-    @classmethod
-    def dependencies(cls) -> List[Type["Rule"]]:
-        """返回该规则依赖的前置规则"""
-        return []
-
-    @classmethod
-    def dependents(cls) -> List[Type["Rule"]]:
-        """返回依赖该规则的后置规则"""
-        return []
 
 
 class DeriveShufflePartitionsRule(Rule):
@@ -73,9 +58,13 @@ class DeriveShufflePartitionsRule(Rule):
         原因：预留比例推导会影响资源可用性，
         从而影响分区数的选择。
         """
-        return []  # 在实际实现中应导入 DeriveReservationRatioRule
+        from ray.data._internal.logical.rules.derive_reservation_ratio_rule import (
+            DeriveReservationRatioRule,
+        )
 
-    def apply(self, plan: Any) -> Any:
+        return [DeriveReservationRatioRule]
+
+    def apply(self, plan: Plan) -> Plan:
         """
         应用规则到物理计划
 

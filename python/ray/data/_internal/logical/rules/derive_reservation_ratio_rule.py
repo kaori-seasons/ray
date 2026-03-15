@@ -12,25 +12,10 @@ Ray Data CBO Phase 2: 物理优化规则
 from typing import List, Type, Dict, Any
 import logging
 
+from ray.data._internal.logical.interfaces.optimizer import Rule
+from ray.data._internal.logical.interfaces.plan import Plan
+
 logger = logging.getLogger(__name__)
-
-
-class Rule:
-    """优化规则的基类接口"""
-
-    def apply(self, plan: Any) -> Any:
-        """应用规则到执行计划"""
-        raise NotImplementedError
-
-    @classmethod
-    def dependencies(cls) -> List[Type["Rule"]]:
-        """返回该规则依赖的前置规则"""
-        return []
-
-    @classmethod
-    def dependents(cls) -> List[Type["Rule"]]:
-        """返回依赖该规则的后置规则"""
-        return []
 
 
 class DeriveReservationRatioRule(Rule):
@@ -63,9 +48,11 @@ class DeriveReservationRatioRule(Rule):
         原因：算子融合会改变算子数量和资源需求，
         必须融合完成后再推导预留比例。
         """
-        return []  # 这里使用空列表，实际实现时应导入 FuseOperators
+        from ray.data._internal.logical.rules.operator_fusion import FuseOperators
 
-    def apply(self, plan: Any) -> Any:
+        return [FuseOperators]
+
+    def apply(self, plan: Plan) -> Plan:
         """
         应用规则到物理计划
 
@@ -82,17 +69,24 @@ class DeriveReservationRatioRule(Rule):
                 logger.debug("No statistics available, skipping R derivation")
                 return plan
 
-            # 2. 估算代价
+            # 2. 检查 CBO 是否启用
+            context = getattr(plan, 'context', None)
+            if context is not None:
+                if not getattr(context, 'enable_cost_based_optimization', True):
+                    logger.debug("CBO disabled, skipping R derivation")
+                    return plan
+
+            # 3. 估算代价
             op_costs = self._estimate_costs(plan, statistics_cache)
 
-            # 3. 提取管线特征
+            # 4. 提取管线特征
             pipeline_props = self._extract_pipeline_properties(plan)
 
-            # 4. 推导预留比例
+            # 5. 推导预留比例
             from ray.data._internal.stats.cost_model import ReservationRatioDeriver
             derived_ratio = ReservationRatioDeriver.derive(op_costs, pipeline_props)
 
-            # 5. 应用推导结果
+            # 6. 应用推导结果
             return self._apply_derived_ratio(plan, derived_ratio)
 
         except Exception as e:
@@ -211,13 +205,12 @@ class DeriveReservationRatioRule(Rule):
                 has_gpu,
             )
         elif 'Join' in op_type:
-            # 这是一个简化实现，实际需要处理左右输入
+            # 简化实现：假设左右等大
             return cost_estimator.estimate_join_cost(
                 stats.num_rows,
-                stats.num_rows,  # 简化：假设左右等大
-                stats.size_bytes,
-                stats.size_bytes,
                 stats.num_rows,
+                stats.size_bytes,
+                stats.size_bytes,
                 stats.size_bytes,
             )
         elif 'Sort' in op_type:
