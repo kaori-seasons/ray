@@ -1,0 +1,396 @@
+{
+  "runs": [
+    {
+      "mode": "batch",
+      "enable_cbo": false,
+      "duration_s": 3.5384,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.6197,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 268939.8
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.4428,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 376414.16
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.4683,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "batch",
+      "enable_cbo": true,
+      "duration_s": 2.1058,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.374,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 445679.22
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.3146,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 529713.84
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.3752,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": false,
+      "duration_s": 0.5692,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.0317,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 9474656.51
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.1033,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 2904866.8
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.1228,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.001,
+      "latency_p99_ms": 0.038,
+      "latency_mean_ms": 0.001
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": true,
+      "duration_s": 0.9052,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.0491,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 6110233.63
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.0724,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 4144307.04
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.1289,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.001,
+      "latency_p99_ms": 0.001,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "batch",
+      "enable_cbo": false,
+      "duration_s": 3.0049,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.4489,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 371304.18
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.3193,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 521982.46
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.4,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "batch",
+      "enable_cbo": true,
+      "duration_s": 7.8278,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.6693,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 249013.66
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.5233,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 318502.33
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.6013,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": false,
+      "duration_s": 0.9969,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.0666,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 4504211.39
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.2736,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 1096612.97
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.2419,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.001,
+      "latency_p99_ms": 0.001,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": true,
+      "duration_s": 0.804,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.0531,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 5652156.89
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.0761,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 3942131.71
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.1284,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.011,
+      "latency_p99_ms": 0.041,
+      "latency_mean_ms": 0.002
+    },
+    {
+      "mode": "batch",
+      "enable_cbo": false,
+      "duration_s": 2.6361,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.4203,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 396567.91
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.3906,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 426748.95
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.4197,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "batch",
+      "enable_cbo": true,
+      "duration_s": 3.0827,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "SortMap",
+          "time_total_s": 0.5835,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 285646.57
+        },
+        {
+          "operator": "SortReduce",
+          "time_total_s": 0.4909,
+          "output_rows": 166667,
+          "throughput_rows_per_s": 339509.91
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.4541,
+      "total_input_rows": 0,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.0,
+      "latency_p99_ms": 0.0,
+      "latency_mean_ms": 0.0
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": false,
+      "duration_s": 1.2104,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.1244,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 2412036.87
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.1187,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 2528136.94
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.1506,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.001,
+      "latency_p95_ms": 0.007,
+      "latency_p99_ms": 0.064,
+      "latency_mean_ms": 0.002
+    },
+    {
+      "mode": "streaming",
+      "enable_cbo": true,
+      "duration_s": 1.1348,
+      "reservation_ratio": 0.5,
+      "operator_count": 2,
+      "operators": [
+        {
+          "operator": "RepartitionSplit",
+          "time_total_s": 0.1952,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 1536721.24
+        },
+        {
+          "operator": "RepartitionReduce",
+          "time_total_s": 0.1176,
+          "output_rows": 300000,
+          "throughput_rows_per_s": 2551064.7
+        }
+      ],
+      "global_bytes_spilled": 0,
+      "dataset_bytes_spilled": 0,
+      "streaming_schedule_s": 0.1735,
+      "total_input_rows": 300000,
+      "latency_p50_ms": 0.0,
+      "latency_p95_ms": 0.001,
+      "latency_p99_ms": 0.004,
+      "latency_mean_ms": 0.001
+    }
+  ],
+  "aggregates": {
+    "batch-cbo-False": {
+      "runs": 3,
+      "duration_s_mean": 3.0598,
+      "duration_s_stdev": 0.3704,
+      "reservation_ratio_mean": 0.5,
+      "operator_count": 2,
+      "global_bytes_spilled_mean": 0,
+      "dataset_bytes_spilled_mean": 0
+    },
+    "batch-cbo-True": {
+      "runs": 3,
+      "duration_s_mean": 4.3388,
+      "duration_s_stdev": 2.4991,
+      "reservation_ratio_mean": 0.5,
+      "operator_count": 2,
+      "global_bytes_spilled_mean": 0,
+      "dataset_bytes_spilled_mean": 0
+    },
+    "streaming-cbo-False": {
+      "runs": 3,
+      "duration_s_mean": 0.9255,
+      "duration_s_stdev": 0.2666,
+      "reservation_ratio_mean": 0.5,
+      "operator_count": 2,
+      "global_bytes_spilled_mean": 0,
+      "dataset_bytes_spilled_mean": 0,
+      "latency_p50_ms_mean": 0.0,
+      "latency_p95_ms_mean": 0.003,
+      "latency_p99_ms_mean": 0.034
+    },
+    "streaming-cbo-True": {
+      "runs": 3,
+      "duration_s_mean": 0.948,
+      "duration_s_stdev": 0.1384,
+      "reservation_ratio_mean": 0.5,
+      "operator_count": 2,
+      "global_bytes_spilled_mean": 0,
+      "dataset_bytes_spilled_mean": 0,
+      "latency_p50_ms_mean": 0.0,
+      "latency_p95_ms_mean": 0.004,
+      "latency_p99_ms_mean": 0.015
+    }
+  }
+}
