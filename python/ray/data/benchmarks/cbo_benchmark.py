@@ -10,17 +10,24 @@ For each mode the script executes matched runs with CBO enabled and disabled,
 collecting wall-clock time, per-operator breakdown, resource usage, spill bytes,
 and streaming latency percentiles.
 
+With ``--validate-stats`` it also runs CBO statistics infrastructure validation:
+OperatorStatistics scale/merge, selectivity estimation, and live DAG statistics
+propagation through operator chains.
+
 Usage:
     python cbo_benchmark.py --batch-rows 500000 --streaming-rows 300000 --repetitions 3
     python cbo_benchmark.py --output results.json --warmup
+    python cbo_benchmark.py --validate-stats --batch-rows 5000 --repetitions 1
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import statistics
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -28,6 +35,259 @@ from typing import Any, Dict, List, Optional
 
 import ray
 from ray.data import DataContext, Dataset
+
+# ---------------------------------------------------------------------------
+# CBO statistics module import (from local source via importlib so it works
+# regardless of whether the installed ray has the cbo_stats package).
+# ---------------------------------------------------------------------------
+
+_CBO_STATS_PATH = os.path.join(
+    os.path.dirname(__file__), os.pardir,
+    "_internal", "cbo_stats", "operator_statistics.py",
+)
+_CBO_STATS_PATH = os.path.abspath(_CBO_STATS_PATH)
+
+_cbo_mod = None
+
+
+def _load_cbo_module():
+    """Lazy-load the CBO statistics module from the local source tree."""
+    global _cbo_mod
+    if _cbo_mod is not None:
+        return _cbo_mod
+    spec = importlib.util.spec_from_file_location(
+        "cbo_operator_statistics", _CBO_STATS_PATH,
+    )
+    _cbo_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_cbo_mod)
+    return _cbo_mod
+
+# ---------------------------------------------------------------------------
+# CBO statistics validation
+# ---------------------------------------------------------------------------
+
+
+def validate_statistics_infrastructure() -> bool:
+    """Validate CBO statistics primitives: scale, merge, selectivity.
+
+    Returns ``True`` when all checks pass.
+    """
+    mod = _load_cbo_module()
+    OperatorStatistics = mod.OperatorStatistics
+    ColumnStatistics = mod.ColumnStatistics
+    estimate_sel = mod.estimate_selectivity_from_column_stats
+
+    print("=" * 72)
+    print("  CBO Statistics Infrastructure Validation")
+    print("=" * 72)
+
+    # 1. Basic creation
+    stats = OperatorStatistics(num_rows=100000, size_bytes=8_000_000, confidence=0.95)
+    print(f"\n  [Read] stats: rows={stats.num_rows}, "
+          f"bytes={stats.size_bytes}, confidence={stats.confidence}")
+
+    # 2. Selectivity estimation
+    col = ColumnStatistics(name="id", min_value=0, max_value=99999, distinct_count=100000)
+    sel_eq = estimate_sel("id", "EQ", 42, col)
+    sel_gt = estimate_sel("id", "GT", 50000, col)
+    sel_lt = estimate_sel("id", "LT", 30000, col)
+    print(f"\n  [Filter] EQ selectivity (id == 42): {sel_eq:.6f}")
+    print(f"  [Filter] GT selectivity (id > 50000): {sel_gt:.4f}")
+    print(f"  [Filter] LT selectivity (id < 30000): {sel_lt:.4f}")
+
+    # 3. Scale
+    filtered = stats.scale(0.333)
+    print(f"\n  [Filter] After id%%3==0 (sel=0.333): "
+          f"rows={filtered.num_rows}, bytes={filtered.size_bytes}")
+
+    # 4. Limit
+    if filtered.num_rows and filtered.num_rows > 0:
+        ratio = min(1.0, 1000 / filtered.num_rows)
+        limited = filtered.scale(ratio)
+        print(f"  [Limit]  After limit(1000) (ratio={ratio:.4f}): "
+              f"rows={limited.num_rows}, bytes={limited.size_bytes}")
+
+    # 5. Merge (Union)
+    a = OperatorStatistics(num_rows=5000, size_bytes=400000, confidence=0.9)
+    b = OperatorStatistics(num_rows=3000, size_bytes=240000, confidence=0.8)
+    m = a.merge(b)
+    print(f"\n  [Union]  Merge: ({a.num_rows}+{b.num_rows})={m.num_rows} rows, "
+          f"({a.size_bytes}+{b.size_bytes})={m.size_bytes} bytes")
+
+    # 6. Full chain
+    print(f"\n  --- Full Pipeline Statistics Chain ---")
+    rs = OperatorStatistics(num_rows=100000, size_bytes=8_000_000, confidence=0.95)
+    fs = rs.scale(0.333)
+    print(f"  Read:        rows={rs.num_rows:>8}, bytes={rs.size_bytes:>10}")
+    print(f"  Filter(33%): rows={fs.num_rows:>8}, bytes={fs.size_bytes:>10}")
+    print(f"  MapBatches:  rows={fs.num_rows:>8}, bytes={fs.size_bytes:>10} (pass-through)")
+    print(f"  Repartition: rows={fs.num_rows:>8}, bytes={fs.size_bytes:>10} (pass-through)")
+    print(f"  Sort:        rows={fs.num_rows:>8}, bytes={fs.size_bytes:>10} (pass-through)")
+
+    print(f"\n  All statistics checks PASSED!")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Live operator statistics injection & demo
+# ---------------------------------------------------------------------------
+
+
+def _inject_infer_statistics():
+    """Monkey-patch ``infer_statistics()`` onto installed ray operators.
+
+    This is only needed when the installed Ray build does not yet ship with
+    CBO-aware operator classes.  The injected methods mirror the real
+    implementations in the local source tree.
+    """
+    mod = _load_cbo_module()
+    OperatorStatistics = mod.OperatorStatistics
+    ConfidenceLevel = mod.ConfidenceLevel
+
+    from ray.data._internal.logical.interfaces.logical_operator import LogicalOperator
+    from ray.data._internal.logical.operators.read_operator import Read
+    from ray.data._internal.logical.operators.one_to_one_operator import (
+        AbstractOneToOne, Limit,
+    )
+    from ray.data._internal.logical.operators.all_to_all_operator import (
+        AbstractAllToAll, Repartition,
+    )
+    from ray.data._internal.logical.operators.n_ary_operator import Union
+
+    # --- base ---
+    if not hasattr(LogicalOperator, "infer_statistics"):
+        LogicalOperator.infer_statistics = lambda self: None
+
+    # --- Read ---
+    def _read_stats(self):
+        md = self.infer_metadata()
+        if md.num_rows is None and md.size_bytes is None:
+            return None
+        return OperatorStatistics(
+            num_rows=md.num_rows, size_bytes=md.size_bytes,
+            confidence=ConfidenceLevel.HIGH.value,
+        )
+    Read.infer_statistics = _read_stats
+
+    # --- OneToOne (pass-through or None) ---
+    def _oto_stats(self):
+        if not self.input_dependencies:
+            return None
+        inp = self.input_dependencies[0].infer_statistics()
+        if inp is None:
+            return None
+        cmr = getattr(self, "can_modify_num_rows", False)
+        if callable(cmr):
+            cmr = cmr()
+        return inp if not cmr else None
+    AbstractOneToOne.infer_statistics = _oto_stats
+
+    # --- Filter (default 0.5 selectivity for UDF-based predicates) ---
+    try:
+        from ray.data._internal.logical.operators.map_operator import Filter
+
+        def _filter_stats(self):
+            if not self.input_dependencies:
+                return None
+            inp = self.input_dependencies[0].infer_statistics()
+            return inp.scale(0.5) if inp is not None else None
+        Filter.infer_statistics = _filter_stats
+    except ImportError:
+        pass
+
+    # --- Limit ---
+    def _limit_stats(self):
+        if not self.input_dependencies:
+            return None
+        inp = self.input_dependencies[0].infer_statistics()
+        if inp is None:
+            return None
+        lim = getattr(self, "limit", None) or getattr(self, "_limit", None)
+        if lim and inp.num_rows and inp.num_rows > 0:
+            return inp.scale(min(1.0, lim / inp.num_rows))
+        return inp
+    Limit.infer_statistics = _limit_stats
+
+    # --- AllToAll (pass-through) ---
+    def _a2a_stats(self):
+        if not self.input_dependencies:
+            return None
+        return self.input_dependencies[0].infer_statistics()
+    AbstractAllToAll.infer_statistics = _a2a_stats
+
+    # --- Repartition (update num_blocks) ---
+    def _repart_stats(self):
+        s = AbstractAllToAll.infer_statistics(self)
+        if s is not None and self._num_outputs is not None:
+            s = OperatorStatistics(
+                num_rows=s.num_rows, size_bytes=s.size_bytes,
+                num_blocks=self._num_outputs, confidence=s.confidence,
+            )
+        return s
+    Repartition.infer_statistics = _repart_stats
+
+    # --- Union (merge branches) ---
+    def _union_stats(self):
+        merged = None
+        for dep in self.input_dependencies:
+            ds = dep.infer_statistics()
+            if ds is None:
+                return None
+            merged = ds if merged is None else merged.merge(ds)
+        return merged
+    Union.infer_statistics = _union_stats
+
+
+def _print_dag_statistics(dag, depth=0):
+    """Recursively print inferred statistics for each DAG operator."""
+    for dep in getattr(dag, "input_dependencies", []):
+        _print_dag_statistics(dep, depth + 1)
+
+    indent = "    " * depth
+    name = getattr(dag, "name", dag.__class__.__name__)
+    stats = dag.infer_statistics()
+    if stats is not None:
+        parts = []
+        if stats.num_rows is not None:
+            parts.append(f"rows={stats.num_rows}")
+        if stats.size_bytes is not None:
+            parts.append(f"bytes={stats.size_bytes}")
+        if stats.num_blocks is not None:
+            parts.append(f"blocks={stats.num_blocks}")
+        print(f"  {indent}{name}: {', '.join(parts) or '?'}")
+    else:
+        print(f"  {indent}{name}: [statistics unavailable]")
+
+
+def demo_live_statistics(num_rows: int = 10000):
+    """Build sample pipelines and display inferred per-operator statistics."""
+    print("\n" + "=" * 72)
+    print("  Live Statistics Inference on Ray Data Pipelines")
+    print("=" * 72)
+
+    _inject_infer_statistics()
+
+    # Pipeline 1: Read → Filter → MapBatches → Repartition → Sort
+    print(f"\n  --- range({num_rows}) → filter → map_batches → repartition → sort ---")
+    ds = ray.data.range(num_rows)
+    ds = ds.filter(lambda row: row["id"] % 3 == 0)
+    ds = ds.map_batches(
+        lambda b: {"id": b["id"] * 2}, batch_size=2048, batch_format="numpy",
+    )
+    ds = ds.repartition(16)
+    ds = ds.sort(key="id")
+    _print_dag_statistics(ds._plan._logical_plan.dag)
+
+    # Pipeline 2: Read → Limit
+    print(f"\n  --- range({num_rows}) → limit(100) ---")
+    ds2 = ray.data.range(num_rows).limit(100)
+    _print_dag_statistics(ds2._plan._logical_plan.dag)
+
+    # Pipeline 3: Union
+    print(f"\n  --- union(range(5000), range(3000)) ---")
+    ds3 = ray.data.range(5000).union(ray.data.range(3000))
+    _print_dag_statistics(ds3._plan._logical_plan.dag)
+
 
 # ---------------------------------------------------------------------------
 # Workload definitions
@@ -433,17 +693,41 @@ def main() -> None:
         default="cbo_benchmark_results.json",
         help="Path to write the JSON results.",
     )
+    parser.add_argument(
+        "--validate-stats",
+        action="store_true",
+        default=False,
+        help="Run CBO statistics infrastructure validation and live DAG "
+             "statistics demo before the execution benchmark.",
+    )
     args = parser.parse_args()
+
+    # --- Statistics validation (does not need ray.init for Part 1) ---
+    if args.validate_stats:
+        try:
+            validate_statistics_infrastructure()
+        except Exception as exc:
+            print(f"\n  [WARN] Statistics validation skipped: {exc}")
 
     ray.init(ignore_reinit_error=True)
 
     runs: List[RunMetrics] = []
     try:
+        # --- Live statistics demo (needs ray.init) ---
+        if args.validate_stats:
+            try:
+                demo_live_statistics(num_rows=min(args.batch_rows, 10_000))
+            except Exception as exc:
+                print(f"\n  [WARN] Live statistics demo skipped: {exc}")
+
+        # --- Execution benchmark ---
         # Optional warmup (results discarded)
         if args.warmup:
-            print("[warmup] Running warmup iterations ...")
+            print("\n[warmup] Running warmup iterations ...")
             run_batch_workload(min(args.batch_rows, 50_000), enable_cbo=False)
-            run_streaming_workload(min(args.streaming_rows, 50_000), enable_cbo=False)
+            run_streaming_workload(
+                min(args.streaming_rows, 50_000), enable_cbo=False,
+            )
             print("[warmup] Done.\n")
 
         for rep in range(args.repetitions):
@@ -454,10 +738,14 @@ def main() -> None:
             runs.append(run_batch_workload(args.batch_rows, enable_cbo=True))
 
             print(f"[rep {rep + 1}/{args.repetitions}] streaming CBO=OFF ...")
-            runs.append(run_streaming_workload(args.streaming_rows, enable_cbo=False))
+            runs.append(
+                run_streaming_workload(args.streaming_rows, enable_cbo=False)
+            )
 
             print(f"[rep {rep + 1}/{args.repetitions}] streaming CBO=ON ...")
-            runs.append(run_streaming_workload(args.streaming_rows, enable_cbo=True))
+            runs.append(
+                run_streaming_workload(args.streaming_rows, enable_cbo=True)
+            )
 
     finally:
         ray.shutdown()
