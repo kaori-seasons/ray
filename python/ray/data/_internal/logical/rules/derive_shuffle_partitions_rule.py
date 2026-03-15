@@ -75,6 +75,12 @@ class DeriveShufflePartitionsRule(Rule):
             修改后的计划（分区数可能已更新）
         """
         try:
+            context = getattr(plan, 'context', None)
+            if context is not None:
+                if not getattr(context, 'enable_cost_based_optimization', True):
+                    logger.debug("CBO disabled, skipping shuffle partition derivation")
+                    return plan
+
             for op in plan.dag.post_order_iter():
                 if self._is_shuffle_operator(op):
                     derived_partitions = self._derive_partitions(op, plan)

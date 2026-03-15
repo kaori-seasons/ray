@@ -12,7 +12,7 @@ Ray Data CBO Phase 1: 完整的单元测试
 """
 
 import pytest
-from ray.data._internal.stats.operator_statistics import (
+from ray.data._internal.cbo_stats.operator_statistics import (
     OperatorStatistics,
     ColumnStatistics,
     ConfidenceLevel,

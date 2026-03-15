@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ray.data._internal.stats.runtime_feedback_collector import (
+from ray.data._internal.cbo_stats.runtime_feedback_collector import (
     RuntimeFeedbackCollector,
     OpRuntimeMetrics,
     FeedbackCacheEntry,
@@ -246,7 +246,7 @@ class TestRuntimeFeedbackCollector:
 
     def test_feedback_singleton(self):
         """Test global singleton access"""
-        from ray.data._internal.stats.runtime_feedback_collector import (
+        from ray.data._internal.cbo_stats.runtime_feedback_collector import (
             get_feedback_collector,
         )
 

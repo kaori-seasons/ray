@@ -64,8 +64,14 @@ class ApplyRuntimeFeedbackRule(Rule):
             修改后的计划（统计信息可能已更新）
         """
         try:
+            context = getattr(plan, 'context', None)
+            if context is not None:
+                if not getattr(context, 'enable_cost_based_optimization', True):
+                    logger.debug("CBO disabled, skipping runtime feedback")
+                    return plan
+
             # 步骤1：尝试加载反馈
-            from ray.data._internal.stats.runtime_feedback_collector import (
+            from ray.data._internal.cbo_stats.runtime_feedback_collector import (
                 get_feedback_collector,
             )
 
@@ -177,7 +183,7 @@ class ApplyRuntimeFeedbackRule(Rule):
     def _get_plan_hash(self, plan: Any) -> str:
         """获取计划的哈希值（用于日志）"""
         try:
-            from ray.data._internal.stats.runtime_feedback_collector import (
+            from ray.data._internal.cbo_stats.runtime_feedback_collector import (
                 RuntimeFeedbackCollector,
             )
             collector = RuntimeFeedbackCollector()

@@ -17,7 +17,7 @@ from typing import Optional, TYPE_CHECKING
 from abc import ABC
 
 if TYPE_CHECKING:
-    from ray.data._internal.stats.operator_statistics import OperatorStatistics
+    from ray.data._internal.cbo_stats.operator_statistics import OperatorStatistics
 
 
 class LogicalOperator(ABC):

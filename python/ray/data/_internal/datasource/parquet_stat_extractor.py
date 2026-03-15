@@ -232,7 +232,7 @@ def extract_row_count_from_parquet(parquet_metadata: Any) -> Optional[int]:
 
 class ParquetReadOperator(ReadOperator):
     def infer_statistics(self):
-        from ray.data._internal.stats.operator_statistics import (
+        from ray.data._internal.cbo_stats.operator_statistics import (
             OperatorStatistics,
             ColumnStatistics,
             ConfidenceLevel,

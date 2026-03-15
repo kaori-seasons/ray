@@ -75,6 +75,12 @@ class JoinReorderRule(Rule):
             修改后的计划（Join可能已重排序）
         """
         try:
+            context = getattr(plan, 'context', None)
+            if context is not None:
+                if not getattr(context, 'enable_cost_based_optimization', True):
+                    logger.debug("CBO disabled, skipping join reorder")
+                    return plan
+
             for op in plan.dag.post_order_iter():
                 if self._is_join_operator(op):
                     self._try_reorder_join(op)

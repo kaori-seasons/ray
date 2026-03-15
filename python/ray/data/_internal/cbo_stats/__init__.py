@@ -1,19 +1,19 @@
 """Ray Data CBO statistics and cost model primitives."""
 
-from ray.data._internal.stats.operator_statistics import (
+from ray.data._internal.cbo_stats.operator_statistics import (
     ColumnStatistics,
     ConfidenceLevel,
     OperatorStatistics,
     estimate_selectivity_from_column_stats,
 )
-from ray.data._internal.stats.cost_model import (
+from ray.data._internal.cbo_stats.cost_model import (
     CostEstimator,
     CostWeights,
     OperatorCost,
     PipelineProperties,
     ReservationRatioDeriver,
 )
-from ray.data._internal.stats.runtime_feedback_collector import (
+from ray.data._internal.cbo_stats.runtime_feedback_collector import (
     FeedbackCacheEntry,
     OpRuntimeMetrics,
     RuntimeFeedbackCollector,

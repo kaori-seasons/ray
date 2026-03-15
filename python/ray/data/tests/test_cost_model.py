@@ -11,7 +11,7 @@ Ray Data CBO Phase 2: 完整的单元测试与集成测试
 """
 
 import pytest
-from ray.data._internal.stats.cost_model import (
+from ray.data._internal.cbo_stats.cost_model import (
     OperatorCost,
     CostWeights,
     CostEstimator,

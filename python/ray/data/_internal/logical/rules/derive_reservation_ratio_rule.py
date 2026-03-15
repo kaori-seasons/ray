@@ -83,7 +83,7 @@ class DeriveReservationRatioRule(Rule):
             pipeline_props = self._extract_pipeline_properties(plan)
 
             # 5. 推导预留比例
-            from ray.data._internal.stats.cost_model import ReservationRatioDeriver
+            from ray.data._internal.cbo_stats.cost_model import ReservationRatioDeriver
             derived_ratio = ReservationRatioDeriver.derive(op_costs, pipeline_props)
 
             # 6. 应用推导结果
@@ -133,7 +133,7 @@ class DeriveReservationRatioRule(Rule):
         返回：
             {op_name -> OperatorCost}
         """
-        from ray.data._internal.stats.cost_model import (
+        from ray.data._internal.cbo_stats.cost_model import (
             CostEstimator,
             OperatorCost,
         )
@@ -180,7 +180,7 @@ class DeriveReservationRatioRule(Rule):
         返回：
             OperatorCost 对象
         """
-        from ray.data._internal.stats.cost_model import OperatorCost
+        from ray.data._internal.cbo_stats.cost_model import OperatorCost
 
         op_type = type(op).__name__
 
@@ -231,7 +231,7 @@ class DeriveReservationRatioRule(Rule):
         - 是否有 GPU 算子
         - 是否有 AllToAll（Sort/Shuffle）
         """
-        from ray.data._internal.stats.cost_model import PipelineProperties
+        from ray.data._internal.cbo_stats.cost_model import PipelineProperties
 
         num_stages = 0
         has_gpu_ops = False
