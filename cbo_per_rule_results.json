@@ -1,0 +1,138 @@
+{
+  "mode": "per-rule",
+  "config": {
+    "num_rows": 50000,
+    "repetitions": 1
+  },
+  "results": [
+    {
+      "rule_name": "OperatorFusion",
+      "rule_category": "RBO",
+      "optimization_goal": "Throughput",
+      "pipeline_desc": "range->map(x2)->map(+1)->map(heavy)",
+      "baseline_label": "No fusion",
+      "optimized_label": "Fused",
+      "baseline_time_s": 1.641,
+      "optimized_time_s": 0.228,
+      "improvement_pct": 86.1,
+      "sweep_detail": null
+    },
+    {
+      "rule_name": "PredicatePushdown",
+      "rule_category": "RBO",
+      "optimization_goal": "Throughput",
+      "pipeline_desc": "range->[filter <-> map(heavy)]",
+      "baseline_label": "Filter after map",
+      "optimized_label": "Filter before map",
+      "baseline_time_s": 0.189,
+      "optimized_time_s": 0.205,
+      "improvement_pct": -8.5,
+      "sweep_detail": null
+    },
+    {
+      "rule_name": "LimitPushdown",
+      "rule_category": "RBO",
+      "optimization_goal": "Throughput",
+      "pipeline_desc": "range(50000)->[limit(1000) <-> map+sort]",
+      "baseline_label": "Limit after map+sort",
+      "optimized_label": "Limit before map+sort",
+      "baseline_time_s": 1.366,
+      "optimized_time_s": 0.282,
+      "improvement_pct": 79.4,
+      "sweep_detail": null
+    },
+    {
+      "rule_name": "CombineShuffles",
+      "rule_category": "RBO",
+      "optimization_goal": "Throughput",
+      "pipeline_desc": "map->repart(32)->repart(16) vs map->repart(16)",
+      "baseline_label": "Double repart",
+      "optimized_label": "Single repart",
+      "baseline_time_s": 0.558,
+      "optimized_time_s": 0.277,
+      "improvement_pct": 50.3,
+      "sweep_detail": null
+    },
+    {
+      "rule_name": "DeriveReservationRatio",
+      "rule_category": "CBO",
+      "optimization_goal": "Resource",
+      "pipeline_desc": "filter->map->sort @ sweep R",
+      "baseline_label": "R=0.5",
+      "optimized_label": "R=0.5",
+      "baseline_time_s": 0.349,
+      "optimized_time_s": 0.349,
+      "improvement_pct": 0.0,
+      "sweep_detail": [
+        {
+          "ratio": 0.1,
+          "time_s": 0.414,
+          "is_default": false
+        },
+        {
+          "ratio": 0.3,
+          "time_s": 0.399,
+          "is_default": false
+        },
+        {
+          "ratio": 0.5,
+          "time_s": 0.349,
+          "is_default": true
+        },
+        {
+          "ratio": 0.7,
+          "time_s": 0.355,
+          "is_default": false
+        },
+        {
+          "ratio": 0.9,
+          "time_s": 0.397,
+          "is_default": false
+        }
+      ]
+    },
+    {
+      "rule_name": "DeriveShufflePartitions",
+      "rule_category": "CBO",
+      "optimization_goal": "Resource",
+      "pipeline_desc": "map->repart(N) @ sweep N",
+      "baseline_label": "N=64",
+      "optimized_label": "N=8",
+      "baseline_time_s": 0.589,
+      "optimized_time_s": 0.156,
+      "improvement_pct": 73.5,
+      "sweep_detail": [
+        {
+          "num_partitions": 4,
+          "time_s": 1.026,
+          "is_default": false
+        },
+        {
+          "num_partitions": 8,
+          "time_s": 0.156,
+          "is_default": false
+        },
+        {
+          "num_partitions": 16,
+          "time_s": 0.254,
+          "is_default": false
+        },
+        {
+          "num_partitions": 32,
+          "time_s": 0.416,
+          "is_default": false
+        },
+        {
+          "num_partitions": 64,
+          "time_s": 0.589,
+          "is_default": true
+        },
+        {
+          "num_partitions": 128,
+          "time_s": 0.486,
+          "is_default": false
+        }
+      ]
+    }
+  ]
+}

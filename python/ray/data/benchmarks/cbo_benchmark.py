@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Production-grade benchmark for Ray Data CBO (Cost-Based Optimizer).
 
-Measures the impact of CBO on two representative execution modes:
+Provides three complementary benchmark modes:
 
-1. **Batch pipeline**: Read → Filter → Map (expansion) → Repartition → Sort → Materialize
-2. **Streaming pipeline**: Read → Shuffle → Map (normalize) → Repartition → iter_batches
+1. **Per-rule** (``--per-rule``): Benchmarks each optimisation rule individually,
+   comparing a *baseline* pipeline against an *optimised* pipeline.  Results
+   are presented in a compact summary table with parameter-sweep details for
+   CBO rules.
+2. **End-to-end** (default): Matched CBO-ON / CBO-OFF runs on representative
+   batch and streaming pipelines.
+3. **Statistics validation** (``--validate-stats``): Checks the CBO statistics
+   infrastructure (scale, merge, selectivity, DAG propagation).
 
-For each mode the script executes matched runs with CBO enabled and disabled,
-collecting wall-clock time, per-operator breakdown, resource usage, spill bytes,
-and streaming latency percentiles.
-
-With ``--validate-stats`` it also runs CBO statistics infrastructure validation:
-OperatorStatistics scale/merge, selectivity estimation, and live DAG statistics
-propagation through operator chains.
-
-Usage:
+Usage examples:
+    python cbo_benchmark.py --per-rule --num-rows 200000 --repetitions 2
+    python cbo_benchmark.py --per-rule --rules OperatorFusion,LimitPushdown
     python cbo_benchmark.py --batch-rows 500000 --streaming-rows 300000 --repetitions 3
-    python cbo_benchmark.py --output results.json --warmup
-    python cbo_benchmark.py --validate-stats --batch-rows 5000 --repetitions 1
+    python cbo_benchmark.py --validate-stats --num-rows 5000 --repetitions 1
 """
 
 from __future__ import annotations
@@ -655,54 +654,435 @@ def _format_comparison(aggregates: Dict[str, Dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Per-rule benchmark framework
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class RuleBenchResult:
+    """Result of a single per-rule benchmark."""
+
+    rule_name: str
+    rule_category: str  # "RBO" | "CBO"
+    optimization_goal: str  # "Throughput" | "Resource"
+    pipeline_desc: str
+    baseline_label: str
+    optimized_label: str
+    baseline_time_s: float
+    optimized_time_s: float
+    improvement_pct: float  # positive => faster
+    sweep_detail: Optional[List[Dict[str, Any]]] = None
+
+
+def _timed_materialize(build_fn, reps: int = 1) -> float:
+    """Build & materialize *reps* times; return mean wall-clock seconds."""
+    times: List[float] = []
+    for _ in range(reps):
+        ds = build_fn()
+        t0 = time.perf_counter()
+        ds.materialize()
+        times.append(time.perf_counter() - t0)
+    return statistics.mean(times)
+
+
+@contextmanager
+def _without_physical_rule(rule_cls):
+    """Temporarily remove *rule_cls* from the physical ruleset."""
+    from ray.data._internal.logical.optimizers import get_physical_ruleset
+
+    rs = get_physical_ruleset()
+    rs.remove(rule_cls)
+    try:
+        yield
+    finally:
+        rs.add(rule_cls)
+
+
+def _heavy_udf(batch):
+    """CPU-intensive UDF (module-level for pickling)."""
+    import numpy as np
+
+    arr = batch["id"].astype(np.float64)
+    for _ in range(5):
+        arr = np.sin(arr) * np.cos(arr) + np.sqrt(np.abs(arr) + 1)
+    return {"id": arr}
+
+
+def _extra_heavy_udf(batch):
+    """Extra-heavy UDF used where the computation gap must be visible."""
+    import numpy as np
+
+    arr = batch["id"].astype(np.float64)
+    for _ in range(50):
+        arr = np.sin(arr) * np.cos(arr) + np.sqrt(np.abs(arr) + 1)
+    return {"id": arr}
+
+
+# ---- individual rule benchmarks ------------------------------------------
+
+
+def bench_operator_fusion(num_rows: int, reps: int) -> RuleBenchResult:
+    """OperatorFusion: fused vs unfused map chain."""
+    from ray.data._internal.logical.rules.operator_fusion import FuseOperators
+
+    def build():
+        ds = ray.data.range(num_rows)
+        ds = ds.map_batches(lambda b: {"id": b["id"] * 2}, batch_format="numpy")
+        ds = ds.map_batches(lambda b: {"id": b["id"] + 1}, batch_format="numpy")
+        return ds.map_batches(_heavy_udf, batch_format="numpy")
+
+    with _without_physical_rule(FuseOperators):
+        t_off = _timed_materialize(build, reps)
+    t_on = _timed_materialize(build, reps)
+    imp = (t_off - t_on) / t_off * 100 if t_off > 0 else 0
+    return RuleBenchResult(
+        rule_name="OperatorFusion", rule_category="RBO",
+        optimization_goal="Throughput",
+        pipeline_desc="range->map(x2)->map(+1)->map(heavy)",
+        baseline_label="No fusion", optimized_label="Fused",
+        baseline_time_s=round(t_off, 3), optimized_time_s=round(t_on, 3),
+        improvement_pct=round(imp, 1),
+    )
+
+
+def bench_predicate_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
+    """PredicatePushdown: filter-late vs filter-early.
+
+    Uses an extra-heavy UDF so that the computation gap between
+    processing 100 %% vs ~33 %% of rows is clearly visible even at
+    moderate row counts.
+    """
+
+    def build_late():
+        ds = ray.data.range(num_rows)
+        ds = ds.map_batches(_extra_heavy_udf, batch_format="numpy")
+        return ds.filter(lambda row: row["id"] > 0)
+
+    def build_early():
+        ds = ray.data.range(num_rows)
+        ds = ds.filter(lambda row: row["id"] % 3 == 0)
+        return ds.map_batches(_extra_heavy_udf, batch_format="numpy")
+
+    t_late = _timed_materialize(build_late, reps)
+    t_early = _timed_materialize(build_early, reps)
+    imp = (t_late - t_early) / t_late * 100 if t_late > 0 else 0
+    return RuleBenchResult(
+        rule_name="PredicatePushdown", rule_category="RBO",
+        optimization_goal="Throughput",
+        pipeline_desc="range->[filter <-> map(heavy)]",
+        baseline_label="Filter after map", optimized_label="Filter before map",
+        baseline_time_s=round(t_late, 3), optimized_time_s=round(t_early, 3),
+        improvement_pct=round(imp, 1),
+    )
+
+
+def bench_limit_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
+    """LimitPushdown: limit-late vs limit-early.
+
+    The baseline places a sort (AllToAll) before the limit, forcing full
+    materialisation of all rows through the heavy UDF.  The optimised
+    variant limits first, so only *limit_n* rows flow through the UDF
+    and subsequent sort.
+    """
+    limit_n = max(1000, num_rows // 100)
+
+    def build_late():
+        ds = ray.data.range(num_rows)
+        ds = ds.map_batches(_heavy_udf, batch_format="numpy")
+        ds = ds.sort(key="id")  # AllToAll forces full materialisation
+        return ds.limit(limit_n)
+
+    def build_early():
+        ds = ray.data.range(num_rows)
+        ds = ds.limit(limit_n)
+        ds = ds.map_batches(_heavy_udf, batch_format="numpy")
+        return ds.sort(key="id")
+
+    t_late = _timed_materialize(build_late, reps)
+    t_early = _timed_materialize(build_early, reps)
+    imp = (t_late - t_early) / t_late * 100 if t_late > 0 else 0
+    return RuleBenchResult(
+        rule_name="LimitPushdown", rule_category="RBO",
+        optimization_goal="Throughput",
+        pipeline_desc=f"range({num_rows})->[limit({limit_n}) <-> map+sort]",
+        baseline_label="Limit after map+sort",
+        optimized_label="Limit before map+sort",
+        baseline_time_s=round(t_late, 3), optimized_time_s=round(t_early, 3),
+        improvement_pct=round(imp, 1),
+    )
+
+
+def bench_combine_shuffles(num_rows: int, reps: int) -> RuleBenchResult:
+    """CombineShuffles: two consecutive repartitions vs one.
+
+    A map_batches is placed before the repartitions so the total pipeline
+    cost is dominated by the shuffle stages, making the difference
+    between one and two shuffles visible.
+    """
+
+    def build_double():
+        ds = ray.data.range(num_rows)
+        ds = ds.map_batches(_heavy_udf, batch_format="numpy")
+        ds = ds.repartition(32)
+        return ds.repartition(16)
+
+    def build_single():
+        ds = ray.data.range(num_rows)
+        ds = ds.map_batches(_heavy_udf, batch_format="numpy")
+        return ds.repartition(16)
+
+    t_double = _timed_materialize(build_double, reps)
+    t_single = _timed_materialize(build_single, reps)
+    imp = (t_double - t_single) / t_double * 100 if t_double > 0 else 0
+    return RuleBenchResult(
+        rule_name="CombineShuffles", rule_category="RBO",
+        optimization_goal="Throughput",
+        pipeline_desc="map->repart(32)->repart(16) vs map->repart(16)",
+        baseline_label="Double repart", optimized_label="Single repart",
+        baseline_time_s=round(t_double, 3), optimized_time_s=round(t_single, 3),
+        improvement_pct=round(imp, 1),
+    )
+
+
+def bench_reservation_ratio(num_rows: int, reps: int) -> RuleBenchResult:
+    """DeriveReservationRatio: sweep reservation-ratio on a sort pipeline."""
+    ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
+    default_r = 0.5
+    sweep: List[Dict[str, Any]] = []
+    for ratio in ratios:
+        ctx = DataContext.get_current().copy()
+        ctx.op_resource_reservation_ratio = ratio
+        ctx.op_resource_reservation_enabled = True
+        ctx.execution_options.verbose_progress = False
+        with _context_scope(ctx):
+            def _build(r=ratio):  # noqa: B023
+                ds = ray.data.range(num_rows)
+                ds = ds.filter(lambda row: row["id"] % 2 == 0)
+                ds = ds.map_batches(_heavy_udf, batch_format="numpy")
+                return ds.sort(key="id")
+            t = _timed_materialize(_build, reps)
+        sweep.append({"ratio": ratio, "time_s": round(t, 3),
+                       "is_default": ratio == default_r})
+    best = min(sweep, key=lambda e: e["time_s"])
+    dflt = next(e for e in sweep if e["is_default"])
+    imp = ((dflt["time_s"] - best["time_s"]) / dflt["time_s"] * 100
+           if dflt["time_s"] > 0 else 0)
+    return RuleBenchResult(
+        rule_name="DeriveReservationRatio", rule_category="CBO",
+        optimization_goal="Resource",
+        pipeline_desc="filter->map->sort @ sweep R",
+        baseline_label=f"R={default_r}",
+        optimized_label=f"R={best['ratio']}",
+        baseline_time_s=dflt["time_s"], optimized_time_s=best["time_s"],
+        improvement_pct=round(imp, 1), sweep_detail=sweep,
+    )
+
+
+def bench_shuffle_partitions(num_rows: int, reps: int) -> RuleBenchResult:
+    """DeriveShufflePartitions: sweep partition counts for repartition."""
+    counts = [4, 8, 16, 32, 64, 128]
+    default_n = 64
+    sweep: List[Dict[str, Any]] = []
+    for n in counts:
+        def _build(n_parts=n):  # noqa: B023
+            ds = ray.data.range(num_rows)
+            ds = ds.map_batches(
+                lambda b: {"id": b["id"] * 2}, batch_format="numpy",
+            )
+            return ds.repartition(n_parts)
+        t = _timed_materialize(_build, reps)
+        sweep.append({"num_partitions": n, "time_s": round(t, 3),
+                       "is_default": n == default_n})
+    best = min(sweep, key=lambda e: e["time_s"])
+    dflt = next(e for e in sweep if e["is_default"])
+    imp = ((dflt["time_s"] - best["time_s"]) / dflt["time_s"] * 100
+           if dflt["time_s"] > 0 else 0)
+    return RuleBenchResult(
+        rule_name="DeriveShufflePartitions", rule_category="CBO",
+        optimization_goal="Resource",
+        pipeline_desc="map->repart(N) @ sweep N",
+        baseline_label=f"N={default_n}",
+        optimized_label=f"N={best['num_partitions']}",
+        baseline_time_s=dflt["time_s"], optimized_time_s=best["time_s"],
+        improvement_pct=round(imp, 1), sweep_detail=sweep,
+    )
+
+
+# ---- registry & orchestrator ---------------------------------------------
+
+ALL_RULE_BENCHMARKS = [
+    ("OperatorFusion", bench_operator_fusion),
+    ("PredicatePushdown", bench_predicate_pushdown),
+    ("LimitPushdown", bench_limit_pushdown),
+    ("CombineShuffles", bench_combine_shuffles),
+    ("DeriveReservationRatio", bench_reservation_ratio),
+    ("DeriveShufflePartitions", bench_shuffle_partitions),
+]
+
+
+def run_per_rule_benchmarks(
+    num_rows: int,
+    reps: int,
+    warmup: bool = False,
+    rules: Optional[List[str]] = None,
+) -> List[RuleBenchResult]:
+    """Execute per-rule benchmarks and return ordered results."""
+    selected = ALL_RULE_BENCHMARKS
+    if rules:
+        wanted = {r.lower() for r in rules}
+        selected = [
+            (n, f) for n, f in ALL_RULE_BENCHMARKS if n.lower() in wanted
+        ]
+    if warmup:
+        print("\n[warmup] Running warmup pipeline ...")
+        ray.data.range(min(num_rows, 50_000)).map_batches(
+            lambda b: b, batch_format="numpy",
+        ).materialize()
+        print("[warmup] Done.\n")
+    results: List[RuleBenchResult] = []
+    for name, fn in selected:
+        print(f"  [{name}] Running ...")
+        try:
+            r = fn(num_rows, reps)
+            results.append(r)
+            print(
+                f"  [{name}] baseline={r.baseline_time_s:.3f}s  "
+                f"optimized={r.optimized_time_s:.3f}s  "
+                f"delta={r.improvement_pct:+.1f}%"
+            )
+        except Exception as exc:
+            print(f"  [{name}] FAILED: {exc}")
+    return results
+
+
+# ---- structured table output ----------------------------------------------
+
+
+def _fmt_sweep(
+    entries: List[Dict[str, Any]], key: str, label: str,
+) -> List[str]:
+    """Format a parameter-sweep sub-table."""
+    lines: List[str] = []
+    default_t = next(e["time_s"] for e in entries if e["is_default"])
+    best_t = min(e["time_s"] for e in entries)
+    lines.append(f"    {label:<12} {'Time (s)':>10}  {'vs Default':>12}")
+    lines.append(f"    {'---' * 13}")
+    for e in entries:
+        val = e[key]
+        delta = (
+            (e["time_s"] - default_t) / default_t * 100
+            if default_t > 0 else 0
+        )
+        tag = "  (default)" if e["is_default"] else ""
+        if e["time_s"] == best_t and not e["is_default"]:
+            tag = "  <- best"
+        fmt_val = f"{val:.2f}" if isinstance(val, float) else str(val)
+        lines.append(
+            f"    {fmt_val:<12} {e['time_s']:>10.3f}  {delta:>+11.1f}%{tag}"
+        )
+    return lines
+
+
+def format_rule_results_table(
+    results: List[RuleBenchResult], num_rows: int, reps: int,
+) -> str:
+    """Return a structured report of per-rule benchmark results."""
+    W = 88
+    sep = "=" * W
+    lines: List[str] = [
+        sep,
+        "  Ray Data Optimization Rules - Per-Rule Benchmark Results",
+        sep,
+        f"  Config: {num_rows:,} rows x {reps} rep(s)\n",
+    ]
+    # summary table
+    hdr = (
+        f"  {'Rule':<26} {'Type':>4}  {'Goal':<11}"
+        f"{'Baseline':>10} {'Optimized':>10} {'Improv.':>9}"
+    )
+    lines.append(hdr)
+    lines.append(f"  {'-' * (W - 4)}")
+    for r in results:
+        arrow = "+" if r.improvement_pct >= 0 else "-"
+        lines.append(
+            f"  {r.rule_name:<26} {r.rule_category:>4}  "
+            f"{r.optimization_goal:<11}"
+            f"{r.baseline_time_s:>9.3f}s {r.optimized_time_s:>9.3f}s "
+            f"{arrow}{abs(r.improvement_pct):>7.1f}%"
+        )
+    lines.append(f"  {'-' * (W - 4)}")
+    # legend
+    lines.append("\n  Legend:")
+    for r in results:
+        lines.append(f"    {r.rule_name:<26} {r.pipeline_desc}")
+        lines.append(
+            f"    {'':<26} baseline: {r.baseline_label}"
+            f" | optimized: {r.optimized_label}"
+        )
+    # sweep details
+    for r in results:
+        if not r.sweep_detail:
+            continue
+        lines.append(f"\n  {r.rule_name} - Parameter Sweep:")
+        if "ratio" in r.sweep_detail[0]:
+            lines.extend(_fmt_sweep(r.sweep_detail, "ratio", "Ratio"))
+        elif "num_partitions" in r.sweep_detail[0]:
+            lines.extend(
+                _fmt_sweep(r.sweep_detail, "num_partitions", "N parts")
+            )
+    lines.append(f"\n{sep}")
+    return "\n".join(lines)
+
+
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Production benchmark for Ray Data CBO."
     )
+    # -- mode selection --
     parser.add_argument(
-        "--batch-rows",
-        type=int,
-        default=200_000,
-        help="Number of rows for the batch workload.",
+        "--per-rule", action="store_true", default=False,
+        help="Run per-rule benchmarks instead of end-to-end comparison.",
     )
     parser.add_argument(
-        "--streaming-rows",
-        type=int,
-        default=150_000,
-        help="Number of rows for the streaming workload.",
+        "--rules", type=str, default=None,
+        help="Comma-separated rule names to benchmark (default: all).  "
+             "E.g. 'OperatorFusion,LimitPushdown'.",
     )
     parser.add_argument(
-        "--repetitions",
-        type=int,
-        default=3,
+        "--validate-stats", action="store_true", default=False,
+        help="Run CBO statistics infrastructure validation.",
+    )
+    # -- data scale --
+    parser.add_argument(
+        "--num-rows", type=int, default=200_000,
+        help="Row count for per-rule benchmarks (default: 200000).",
+    )
+    parser.add_argument(
+        "--batch-rows", type=int, default=200_000,
+        help="Row count for end-to-end batch workload.",
+    )
+    parser.add_argument(
+        "--streaming-rows", type=int, default=150_000,
+        help="Row count for end-to-end streaming workload.",
+    )
+    # -- execution --
+    parser.add_argument(
+        "--repetitions", type=int, default=3,
         help="How many times to repeat each configuration.",
     )
     parser.add_argument(
-        "--warmup",
-        action="store_true",
-        default=False,
+        "--warmup", action="store_true", default=False,
         help="Run a warmup iteration (discarded) before timing.",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="cbo_benchmark_results.json",
+        "--output", type=str, default="cbo_benchmark_results.json",
         help="Path to write the JSON results.",
-    )
-    parser.add_argument(
-        "--validate-stats",
-        action="store_true",
-        default=False,
-        help="Run CBO statistics infrastructure validation and live DAG "
-             "statistics demo before the execution benchmark.",
     )
     args = parser.parse_args()
 
-    # --- Statistics validation (does not need ray.init for Part 1) ---
+    # -- statistics validation (Part 1 does not need ray.init) --
     if args.validate_stats:
         try:
             validate_statistics_infrastructure()
@@ -711,57 +1091,90 @@ def main() -> None:
 
     ray.init(ignore_reinit_error=True)
 
-    runs: List[RunMetrics] = []
+    rule_results: Optional[List[RuleBenchResult]] = None
+    e2e_runs: List[RunMetrics] = []
+
     try:
-        # --- Live statistics demo (needs ray.init) ---
         if args.validate_stats:
             try:
-                demo_live_statistics(num_rows=min(args.batch_rows, 10_000))
+                demo_live_statistics(
+                    num_rows=min(args.num_rows, 10_000),
+                )
             except Exception as exc:
                 print(f"\n  [WARN] Live statistics demo skipped: {exc}")
 
-        # --- Execution benchmark ---
-        # Optional warmup (results discarded)
-        if args.warmup:
-            print("\n[warmup] Running warmup iterations ...")
-            run_batch_workload(min(args.batch_rows, 50_000), enable_cbo=False)
-            run_streaming_workload(
-                min(args.streaming_rows, 50_000), enable_cbo=False,
+        if args.per_rule:
+            # -- per-rule benchmark mode --
+            rule_list = (
+                [r.strip() for r in args.rules.split(",")]
+                if args.rules else None
             )
-            print("[warmup] Done.\n")
-
-        for rep in range(args.repetitions):
-            print(f"[rep {rep + 1}/{args.repetitions}] batch CBO=OFF ...")
-            runs.append(run_batch_workload(args.batch_rows, enable_cbo=False))
-
-            print(f"[rep {rep + 1}/{args.repetitions}] batch CBO=ON ...")
-            runs.append(run_batch_workload(args.batch_rows, enable_cbo=True))
-
-            print(f"[rep {rep + 1}/{args.repetitions}] streaming CBO=OFF ...")
-            runs.append(
-                run_streaming_workload(args.streaming_rows, enable_cbo=False)
+            rule_results = run_per_rule_benchmarks(
+                num_rows=args.num_rows,
+                reps=args.repetitions,
+                warmup=args.warmup,
+                rules=rule_list,
             )
+        else:
+            # -- end-to-end comparison mode --
+            if args.warmup:
+                print("\n[warmup] Running warmup iterations ...")
+                run_batch_workload(
+                    min(args.batch_rows, 50_000), enable_cbo=False,
+                )
+                run_streaming_workload(
+                    min(args.streaming_rows, 50_000), enable_cbo=False,
+                )
+                print("[warmup] Done.\n")
 
-            print(f"[rep {rep + 1}/{args.repetitions}] streaming CBO=ON ...")
-            runs.append(
-                run_streaming_workload(args.streaming_rows, enable_cbo=True)
-            )
-
+            for rep in range(args.repetitions):
+                print(f"[rep {rep+1}/{args.repetitions}] batch CBO=OFF ...")
+                e2e_runs.append(
+                    run_batch_workload(args.batch_rows, enable_cbo=False)
+                )
+                print(f"[rep {rep+1}/{args.repetitions}] batch CBO=ON ...")
+                e2e_runs.append(
+                    run_batch_workload(args.batch_rows, enable_cbo=True)
+                )
+                print(f"[rep {rep+1}/{args.repetitions}] streaming CBO=OFF")
+                e2e_runs.append(
+                    run_streaming_workload(
+                        args.streaming_rows, enable_cbo=False,
+                    )
+                )
+                print(f"[rep {rep+1}/{args.repetitions}] streaming CBO=ON")
+                e2e_runs.append(
+                    run_streaming_workload(
+                        args.streaming_rows, enable_cbo=True,
+                    )
+                )
     finally:
         ray.shutdown()
 
-    aggregates = aggregate_runs(runs)
-
-    output_payload = {
-        "runs": [asdict(run) for run in runs],
-        "aggregates": aggregates,
-    }
+    # -- reporting (does not need Ray) --
+    if rule_results is not None:
+        print(format_rule_results_table(
+            rule_results, args.num_rows, args.repetitions,
+        ))
+        payload: Dict[str, Any] = {
+            "mode": "per-rule",
+            "config": {
+                "num_rows": args.num_rows,
+                "repetitions": args.repetitions,
+            },
+            "results": [asdict(r) for r in rule_results],
+        }
+    else:
+        aggregates = aggregate_runs(e2e_runs)
+        print(_format_comparison(aggregates))
+        payload = {
+            "mode": "end-to-end",
+            "runs": [asdict(r) for r in e2e_runs],
+            "aggregates": aggregates,
+        }
 
     with open(args.output, "w", encoding="utf-8") as fp:
-        json.dump(output_payload, fp, indent=2)
-
-    # Print human-readable comparison
-    print(_format_comparison(aggregates))
+        json.dump(payload, fp, indent=2)
     print(f"\nFull results written to {os.path.abspath(args.output)}")
 
 
