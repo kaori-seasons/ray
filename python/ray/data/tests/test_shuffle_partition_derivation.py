@@ -1,7 +1,7 @@
 """
-Ray Data CBO Phase 3: 完整的单元测试与集成测试
+Ray Data CBO: Shuffle 分区数推导与 Join 重排序优化测试
 
-源码位置：python/ray/data/tests/test_cbo_phase3.py
+源码位置：python/ray/data/tests/test_shuffle_partition_derivation.py
 
 测试覆盖：
 1. DeriveShufflePartitionsRule 的分区数推导
@@ -222,8 +222,8 @@ class TestJoinReorderRule:
             pytest.fail("_try_reorder_join raised an exception for LEFT JOIN")
 
 
-class TestPhase3Integration:
-    """Phase 3 集成测试"""
+class TestShufflePartitionIntegration:
+    """集成测试"""
 
     def test_shuffle_partitions_standard_case(self):
         """测试标准 Shuffle 分区推导场景"""
@@ -309,44 +309,6 @@ class TestPhase3Integration:
             )
             assert result == expected, \
                 f"Failed for {input_bytes} bytes: got {result}, expected {expected}"
-
-
-class TestPhase3Scenarios:
-    """Phase 3 实际场景测试"""
-
-    def test_scenario_standard_shuffle(self):
-        """场景：标准 Shuffle 操作"""
-        # Shuffle 10GB 数据
-        input_size = 10 * 1024 * 1024 * 1024
-        num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
-            total_bytes=input_size,
-        )
-
-        # 验证
-        assert num_partitions == 20
-        avg_partition_size = input_size / num_partitions
-        assert avg_partition_size == 512 * 1024 * 1024
-
-    def test_scenario_join_with_small_build(self):
-        """场景：Join，小表作为 build 侧"""
-        rule = JoinReorderRule()
-
-        # 验证 INNER JOIN 会被处理
-        assert rule._is_join_operator(type('JoinOp', (), {'__name__': 'JoinOperator'})())
-
-    def test_scenario_left_join_no_reorder(self):
-        """场景：LEFT JOIN 不被重排序"""
-        rule = JoinReorderRule()
-
-        class LeftJoinOp:
-            join_type = "LEFT"
-            name = "left_join"
-            _user_config = {}
-
-        # LEFT JOIN 不应该被重排序
-        op = LeftJoinOp()
-        join_type = rule._get_join_type(op)
-        assert join_type == "LEFT"
 
 
 if __name__ == '__main__':
