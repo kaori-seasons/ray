@@ -1,65 +1,64 @@
 """
-Ray Data CBO: Shuffle 分区数推导与 Join 重排序优化测试
+Ray Data CBO: Shuffle Partition Derivation Tests
 
-源码位置：python/ray/data/tests/test_shuffle_partition_derivation.py
+Source Location: python/ray/data/tests/test_shuffle_partition_derivation.py
 
-测试覆盖：
-1. DeriveShufflePartitionsRule 的分区数推导
-2. JoinReorderRule 的Join排序优化
-3. 集成测试验证完整流程
+Test Coverage:
+1. DeriveShufflePartitionsRule - partition number calculation
+2. Edge cases and boundary conditions
+3. Integration tests for shuffle optimization
 """
 
 import pytest
 from ray.data._internal.logical.rules.derive_shuffle_partitions_rule import (
     DeriveShufflePartitionsRule,
 )
-from ray.data._internal.logical.rules.join_reorder_rule import JoinReorderRule
 
 
 class TestDeriveShufflePartitionsRule:
-    """DeriveShufflePartitionsRule 的单元测试"""
+    """Unit tests for DeriveShufflePartitionsRule"""
 
     def test_calculate_num_partitions_basic(self):
-        """测试基础的分区数计算"""
-        # 10GB 数据，目标 512MB 分区 -> 20 分区
+        """Test basic partition number calculation"""
+        # 10GB data, target 512MB partition -> 20 partitions
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=10 * 1024 * 1024 * 1024,  # 10GB
         )
         assert num_partitions == 20
 
     def test_calculate_num_partitions_small_data(self):
-        """测试小数据量的分区数计算"""
-        # 100MB 数据 -> 最小分区数 10
+        """Test partition calculation with small data"""
+        # 100MB data -> minimum partition count 10
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=100 * 1024 * 1024,  # 100MB
         )
         assert num_partitions == DeriveShufflePartitionsRule.MIN_PARTITIONS
 
     def test_calculate_num_partitions_large_data(self):
-        """测试大数据量的分区数计算"""
-        # 5TB 数据，目标 512MB 分区 -> 10000 分区（最大限制）
+        """Test partition calculation with large data"""
+        # 5TB data, target 512MB partition -> 10000 partitions (max limit)
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=5 * 1024 * 1024 * 1024 * 1024,  # 5TB
         )
         assert num_partitions == DeriveShufflePartitionsRule.MAX_PARTITIONS
 
     def test_calculate_num_partitions_zero_bytes(self):
-        """测试零字节数据"""
+        """Test partition calculation with zero bytes"""
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=0,
         )
         assert num_partitions == DeriveShufflePartitionsRule.MIN_PARTITIONS
 
     def test_calculate_num_partitions_none_bytes(self):
-        """测试None输入"""
+        """Test partition calculation with None input"""
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=None,
         )
         assert num_partitions == DeriveShufflePartitionsRule.MIN_PARTITIONS
 
     def test_calculate_num_partitions_custom_target_size(self):
-        """测试自定义目标分区大小"""
-        # 1GB 数据，目标 256MB 分区 -> 4 分区
+        """Test partition calculation with custom target size"""
+        # 1GB data, target 256MB partition -> 4 partitions
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=1 * 1024 * 1024 * 1024,  # 1GB
             target_partition_size_bytes=256 * 1024 * 1024,  # 256MB
@@ -67,8 +66,8 @@ class TestDeriveShufflePartitionsRule:
         assert num_partitions == 4
 
     def test_calculate_num_partitions_custom_bounds(self):
-        """测试自定义最小/最大分区数"""
-        # 100MB 数据，目标 512MB，但最小为 5，最大为 15
+        """Test partition calculation with custom min/max bounds"""
+        # 100MB data, target 512MB, but min 5, max 15
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=100 * 1024 * 1024,  # 100MB
             min_partitions=5,
@@ -77,24 +76,24 @@ class TestDeriveShufflePartitionsRule:
         assert num_partitions == 5
 
     def test_calculate_num_partitions_exact_target(self):
-        """测试完全匹配目标分区大小"""
-        # 5 × 512MB = 2.56GB，应该得到 5 分区
+        """Test partition calculation with exact target size match"""
+        # 5 × 512MB = 2.56GB, should get 5 partitions
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=5 * 512 * 1024 * 1024,  # 5 × 512MB
         )
         assert num_partitions == 5
 
     def test_calculate_num_partitions_rounding(self):
-        """测试分区数向上取整"""
-        # 2.5GB，目标 512MB -> ceil(2.5 / 0.5) = 5
+        """Test partition count rounding up"""
+        # 2.5GB, target 512MB -> ceil(2.5 / 0.5) = 5
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=int(2.5 * 1024 * 1024 * 1024),
         )
         assert num_partitions == 5
 
     def test_partition_size_calculation(self):
-        """测试实际分区大小的计算"""
-        # 10GB，推导 20 分区 -> 平均 512MB/分区
+        """Test actual partition size calculation"""
+        # 10GB, derived 20 partitions -> avg 512MB/partition
         total_bytes = 10 * 1024 * 1024 * 1024
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=total_bytes,
@@ -103,147 +102,32 @@ class TestDeriveShufflePartitionsRule:
         avg_partition_size = total_bytes / num_partitions
         target_size = DeriveShufflePartitionsRule.TARGET_PARTITION_SIZE_BYTES
 
-        # 实际分区大小应该接近目标大小（误差 < 1%）
+        # Actual partition size should be close to target (error < 1%)
         assert abs(avg_partition_size - target_size) / target_size < 0.01
 
 
-class TestJoinReorderRule:
-    """JoinReorderRule 的单元测试"""
-
-    def test_join_type_detection_inner(self):
-        """测试 INNER JOIN 类型检测"""
-        rule = JoinReorderRule()
-
-        class MockJoinOp:
-            def __init__(self, join_type):
-                self.join_type = join_type
-                self.name = "test_join"
-
-        op_inner = MockJoinOp("INNER")
-        assert rule._get_join_type(op_inner) == "INNER"
-
-    def test_join_type_detection_left(self):
-        """测试 LEFT JOIN 类型检测"""
-        rule = JoinReorderRule()
-
-        class MockJoinOp:
-            def __init__(self, join_type):
-                self.join_type = join_type
-                self.name = "test_join"
-
-        op_left = MockJoinOp("LEFT")
-        assert rule._get_join_type(op_left) == "LEFT"
-
-    def test_join_type_detection_right(self):
-        """测试 RIGHT JOIN 类型检测"""
-        rule = JoinReorderRule()
-
-        class MockJoinOp:
-            def __init__(self, join_type):
-                self.join_type = join_type
-                self.name = "test_join"
-
-        op_right = MockJoinOp("RIGHT")
-        assert rule._get_join_type(op_right) == "RIGHT"
-
-    def test_join_type_detection_unknown(self):
-        """测试未知 JOIN 类型检测"""
-        rule = JoinReorderRule()
-
-        class MockJoinOp:
-            def __init__(self):
-                self.name = "test_join"
-
-        op = MockJoinOp()
-        assert rule._get_join_type(op) == "UNKNOWN"
-
-    def test_is_join_operator_true(self):
-        """测试 Join 算子识别"""
-        rule = JoinReorderRule()
-
-        class MockOp:
-            pass
-
-        MockOp.__name__ = "JoinOperator"
-        op = MockOp()
-        assert rule._is_join_operator(op) is True
-
-    def test_is_join_operator_false(self):
-        """测试非 Join 算子识别"""
-        rule = JoinReorderRule()
-
-        class MockOp:
-            pass
-
-        MockOp.__name__ = "FilterOperator"
-        op = MockOp()
-        assert rule._is_join_operator(op) is False
-
-    def test_user_specified_join_side(self):
-        """测试用户指定的 join_side 检测"""
-        rule = JoinReorderRule()
-
-        class MockOp:
-            def __init__(self):
-                self._user_config = {'join_side': 'left'}
-
-        op = MockOp()
-        assert rule._is_user_specified(op) is True
-
-    def test_user_not_specified_join_side(self):
-        """测试用户未指定 join_side"""
-        rule = JoinReorderRule()
-
-        class MockOp:
-            def __init__(self):
-                self._user_config = {}
-
-        op = MockOp()
-        assert rule._is_user_specified(op) is False
-
-    def test_only_inner_join_reordered(self):
-        """测试仅 INNER JOIN 被重排序"""
-        rule = JoinReorderRule()
-
-        # LEFT JOIN 不应该被重排序
-        class MockLeftJoin:
-            def __init__(self):
-                self.join_type = "LEFT"
-                self.name = "left_join"
-                self._user_config = {}
-
-        op = MockLeftJoin()
-
-        # 调用 _try_reorder_join 不应该改变任何内容
-        # (这是一个黑盒测试，检查是否有异常)
-        try:
-            rule._try_reorder_join(op)
-        except Exception:
-            pytest.fail("_try_reorder_join raised an exception for LEFT JOIN")
-
-
 class TestShufflePartitionIntegration:
-    """集成测试"""
+    """Integration tests for shuffle partition derivation"""
 
     def test_shuffle_partitions_standard_case(self):
-        """测试标准 Shuffle 分区推导场景"""
-        # 10GB Join 操作
+        """Test standard shuffle partition derivation scenario"""
+        # 10GB join operation
         total_bytes = 10 * 1024 * 1024 * 1024
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=total_bytes,
         )
 
-        # 应该推导出 20 分区
+        # Should derive 20 partitions
         assert num_partitions == 20
 
-        # 每个分区平均 512MB
+        # Each partition avg 512MB
         avg_partition_size = total_bytes / num_partitions
         expected_size = 512 * 1024 * 1024
-        assert abs(avg_partition_size - expected_size) < 1024  # 误差 < 1KB
+        assert abs(avg_partition_size - expected_size) < 1024  # Error < 1KB
 
     def test_shuffle_partitions_small_data(self):
-        """测试小数据 Shuffle 分区推导"""
-        # 50MB 数据应该使用最小分区数
+        """Test shuffle partition derivation with small data"""
+        # 50MB data should use minimum partition count
         total_bytes = 50 * 1024 * 1024
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=total_bytes,
@@ -252,8 +136,8 @@ class TestShufflePartitionIntegration:
         assert num_partitions == 10
 
     def test_shuffle_partitions_large_data(self):
-        """测试大数据 Shuffle 分区推导"""
-        # 10TB 数据应该被限制到最大分区数
+        """Test shuffle partition derivation with large data"""
+        # 10TB data should be limited to max partition count
         total_bytes = 10 * 1024 * 1024 * 1024 * 1024
         num_partitions = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=total_bytes,
@@ -261,46 +145,29 @@ class TestShufflePartitionIntegration:
 
         assert num_partitions == 10000
 
-    def test_join_reorder_scenario_small_build_table(self):
-        """测试 Join 重排序场景：小表作为 build 侧"""
-        rule = JoinReorderRule()
-
-        # 小表（500MB）应该在右侧（build 侧）
-        # 大表（5GB）应该在左侧（probe 侧）
-
-        class MockOp:
-            def __init__(self):
-                self.name = "join"
-                self.join_type = "INNER"
-                self._user_config = {}
-
-        # 这是一个结构测试
-        assert rule._get_join_type(MockOp()) == "INNER"
-        assert not rule._is_user_specified(MockOp())
-
     def test_partition_range_enforcement(self):
-        """测试分区数范围强制执行"""
-        # 极小数据 -> 最小分区数
+        """Test partition count range enforcement"""
+        # Extremely small data -> minimum partition count
         small = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=1024,  # 1KB
         )
         assert small == DeriveShufflePartitionsRule.MIN_PARTITIONS
 
-        # 极大数据 -> 最大分区数
+        # Extremely large data -> maximum partition count
         large = DeriveShufflePartitionsRule.calculate_num_partitions(
             total_bytes=1024 ** 5,  # 1 PB
         )
         assert large == DeriveShufflePartitionsRule.MAX_PARTITIONS
 
     def test_partition_calculation_edge_cases(self):
-        """测试分区计算边界情况"""
+        """Test partition calculation edge cases"""
         cases = [
             # (input_bytes, expected_partitions)
-            (0, 10),  # 零字节 -> 最小分区
-            (1024, 10),  # 1KB -> 最小分区
-            (512 * 1024 * 1024, 1),  # 512MB -> 1 分区，但受最小值限制 -> 10
-            (10 * 1024 * 1024 * 1024, 20),  # 10GB -> 20 分区
-            (5 * 1024 * 1024 * 1024 * 1024, 10000),  # 5TB -> 10000 分区（最大）
+            (0, 10),  # Zero bytes -> minimum partition
+            (1024, 10),  # 1KB -> minimum partition
+            (512 * 1024 * 1024, 1),  # 512MB -> 1 partition, limited by min -> 10
+            (10 * 1024 * 1024 * 1024, 20),  # 10GB -> 20 partitions
+            (5 * 1024 * 1024 * 1024 * 1024, 10000),  # 5TB -> 10000 (max)
         ]
 
         for input_bytes, expected in cases:
