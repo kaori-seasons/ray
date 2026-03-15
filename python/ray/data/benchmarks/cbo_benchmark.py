@@ -24,6 +24,8 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List
 
 import ray
+from contextlib import contextmanager
+
 from ray.data import DataContext, Dataset
 
 # ---------------------------------------------------------------------------
@@ -134,9 +136,25 @@ def _configure_context(streaming: bool, enable_cbo: bool) -> DataContext:
     return ctx
 
 
+@contextmanager
+def _context_scope(ctx: DataContext):
+    """Compatibility shim for older Ray builds without DataContext.current."""
+
+    if hasattr(DataContext, "current"):
+        with DataContext.current(ctx):
+            yield
+        return
+
+    prev = DataContext._set_current(ctx)
+    try:
+        yield
+    finally:
+        DataContext._set_current(prev)
+
+
 def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
     ctx = _configure_context(streaming=False, enable_cbo=enable_cbo)
-    with DataContext.current(ctx):
+    with _context_scope(ctx):
         ds = build_batch_dataset(num_rows)
         start = time.perf_counter()
         ds.materialize()
@@ -146,7 +164,7 @@ def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
 
 def run_streaming_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
     ctx = _configure_context(streaming=True, enable_cbo=enable_cbo)
-    with DataContext.current(ctx):
+    with _context_scope(ctx):
         ds = build_streaming_dataset(num_rows)
         start = time.perf_counter()
         consumed = 0
