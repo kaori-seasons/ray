@@ -92,8 +92,12 @@ class RunMetrics:
 
 
 def _summarize_stats(ds: Dataset, duration_s: float, mode: str, enable_cbo: bool) -> RunMetrics:
-    stats = ds.stats()
-    summary = stats.to_summary()
+    plan = getattr(ds, "_plan", None)
+    if plan is None:
+        raise RuntimeError("Dataset is missing execution plan; cannot collect stats.")
+
+    plan_stats = plan.stats()
+    summary = plan_stats.to_summary()
     operators_payload = []
     total_input_rows = 0
     for op in summary.operators_stats:
@@ -107,10 +111,12 @@ def _summarize_stats(ds: Dataset, duration_s: float, mode: str, enable_cbo: bool
                 "operator": op.operator_name,
                 "time_total_s": round(op.time_total_s, 4),
                 "output_rows": op_rows,
-                "num_rows_per_s": round(op.num_rows_per_s, 4),
+                "num_rows_per_s": round(
+                    (op_rows / op.time_total_s) if op.time_total_s else 0.0, 4
+                ),
             }
         )
-        total_input_rows += op.total_input_num_rows or 0
+        total_input_rows += getattr(op, "total_input_num_rows", 0) or 0
 
     ctx = DataContext.get_current()
     return RunMetrics(
@@ -145,11 +151,13 @@ def _context_scope(ctx: DataContext):
             yield
         return
 
-    prev = DataContext._set_current(ctx)
+    prev = DataContext.get_current()
+    DataContext._set_current(ctx)
     try:
         yield
     finally:
-        DataContext._set_current(prev)
+        if prev is not None:
+            DataContext._set_current(prev)
 
 
 def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
@@ -157,7 +165,7 @@ def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
     with _context_scope(ctx):
         ds = build_batch_dataset(num_rows)
         start = time.perf_counter()
-        ds.materialize()
+        ds = ds.materialize()
         duration = time.perf_counter() - start
         return _summarize_stats(ds, duration, mode="batch", enable_cbo=enable_cbo)
 
