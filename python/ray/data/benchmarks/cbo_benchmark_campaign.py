@@ -218,12 +218,19 @@ def _normalize_executor_config(
                 {
                     "address": str(backend["address"]),
                     "ray_binary": str(backend.get("ray_binary", "ray")),
+                    "ray_args": [str(arg) for arg in (backend.get("ray_args") or [])],
                     "working_dir": backend.get("working_dir"),
                     "job_working_dir": backend.get("job_working_dir"),
                     "runtime_env_json": backend.get("runtime_env_json"),
                     "submission_id_prefix": str(
                         backend.get("submission_id_prefix", "cbo-bench")
                     ),
+                    "poll_interval_s": float(backend.get("poll_interval_s", 5.0)),
+                    "timeout_s": _parse_duration_seconds(
+                        backend.get("timeout_s", backend.get("timeout")),
+                        3600.0,
+                    ),
+                    "collect_logs": bool(backend.get("collect_logs", True)),
                 }
             )
         elif backend_type == "k8s_job":
@@ -233,6 +240,9 @@ def _normalize_executor_config(
                 {
                     "image": str(backend["image"]),
                     "kubectl_binary": str(backend.get("kubectl_binary", "kubectl")),
+                    "kubectl_args": [
+                        str(arg) for arg in (backend.get("kubectl_args") or [])
+                    ],
                     "namespace": backend.get("namespace"),
                     "job_name_prefix": str(
                         backend.get("job_name_prefix", "cbo-bench")
@@ -242,6 +252,12 @@ def _normalize_executor_config(
                         backend.get("wait_for_completion", True)
                     ),
                     "timeout": str(backend.get("timeout", "3600s")),
+                    "timeout_s": _parse_duration_seconds(
+                        backend.get("timeout_s", backend.get("timeout", "3600s")),
+                        3600.0,
+                    ),
+                    "poll_interval_s": float(backend.get("poll_interval_s", 5.0)),
+                    "collect_logs": bool(backend.get("collect_logs", True)),
                     "cleanup": bool(backend.get("cleanup", False)),
                 }
             )
@@ -831,6 +847,39 @@ def _render_shell_command(task_command: Sequence[str], cwd: Optional[str]) -> st
     return rendered
 
 
+def _parse_duration_seconds(value: Any, default_seconds: float) -> float:
+    if value is None:
+        return default_seconds
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip().lower()
+    if not raw:
+        return default_seconds
+    unit_multipliers = {
+        "s": 1.0,
+        "m": 60.0,
+        "h": 3600.0,
+    }
+    suffix = raw[-1]
+    if suffix in unit_multipliers:
+        return float(raw[:-1]) * unit_multipliers[suffix]
+    return float(raw)
+
+
+def _ray_submission_id(task: Dict[str, Any], backend: Dict[str, Any]) -> str:
+    return (
+        f"{backend.get('submission_id_prefix', 'cbo-bench')}-"
+        f"{_slugify_identifier(task['task_id'])}"
+    )
+
+
+def _k8s_job_name(task: Dict[str, Any], backend: Dict[str, Any]) -> str:
+    return (
+        f"{backend.get('job_name_prefix', 'cbo-bench')}-"
+        f"{_slugify_identifier(task['task_id'], max_length=40)}"
+    )[:63].rstrip("-")
+
+
 def build_backend_command(
     task: Dict[str, Any],
     target: Optional[Dict[str, Any]],
@@ -875,12 +924,10 @@ def build_backend_command(
         ]
         return wrapped, shlex.join(wrapped)
     if backend_type == "ray_job":
-        submission_id = (
-            f"{backend.get('submission_id_prefix', 'cbo-bench')}-"
-            f"{_slugify_identifier(task['task_id'])}"
-        )
+        submission_id = _ray_submission_id(task, backend)
         wrapped = [
             backend.get("ray_binary", "ray"),
+            *list(backend.get("ray_args") or []),
             "job",
             "submit",
             "--address",
@@ -906,13 +953,11 @@ def build_backend_command(
         return wrapped, shlex.join(wrapped)
     if backend_type == "k8s_job":
         kubectl_binary = backend.get("kubectl_binary", "kubectl")
-        job_name = (
-            f"{backend.get('job_name_prefix', 'cbo-bench')}-"
-            f"{_slugify_identifier(task['task_id'], max_length=40)}"
-        )[:63].rstrip("-")
+        job_name = _k8s_job_name(task, backend)
         namespace = backend.get("namespace")
         create_cmd = [
             kubectl_binary,
+            *list(backend.get("kubectl_args") or []),
             "create",
             "job",
             job_name,
@@ -932,27 +977,7 @@ def build_backend_command(
                 ),
             ]
         )
-        if not backend.get("wait_for_completion", True):
-            return create_cmd, shlex.join(create_cmd)
-        wait_cmd = [
-            kubectl_binary,
-            "wait",
-            f"job/{job_name}",
-            "--for=condition=complete",
-            f"--timeout={backend.get('timeout', '3600s')}",
-        ]
-        logs_cmd = [kubectl_binary, "logs", f"job/{job_name}"]
-        if namespace:
-            wait_cmd.extend(["--namespace", str(namespace)])
-            logs_cmd.extend(["--namespace", str(namespace)])
-        chained = [shlex.join(create_cmd), shlex.join(wait_cmd), shlex.join(logs_cmd)]
-        if backend.get("cleanup", False):
-            delete_cmd = [kubectl_binary, "delete", "job", job_name]
-            if namespace:
-                delete_cmd.extend(["--namespace", str(namespace)])
-            chained.append(shlex.join(delete_cmd))
-        wrapped = ["sh", "-lc", " && ".join(chained)]
-        return wrapped, shlex.join(wrapped)
+        return create_cmd, shlex.join(create_cmd)
     raise ValueError(f"Unsupported backend type: {backend_type}")
 
 
@@ -1021,17 +1046,13 @@ def _write_execution_state(executor: Dict[str, Any], state: Dict[str, Any]) -> N
         json.dump(state, fp, indent=2)
 
 
-def _run_campaign_task(
-    task: Dict[str, Any],
-    target: Dict[str, Any],
+def _run_subprocess_command(
+    command: Sequence[str],
+    cwd: Optional[str] = None,
 ) -> Dict[str, Any]:
-    command, launched_command = build_backend_command(
-        task,
-        None if target.get("name") == "local" else target,
-    )
     completed = subprocess.run(
         command,
-        cwd=task.get("cwd") or None,
+        cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
@@ -1042,9 +1063,300 @@ def _run_campaign_task(
     return {
         "returncode": completed.returncode,
         "output_text": output_text,
+    }
+
+
+def _parse_ray_job_status(output_text: str) -> Optional[str]:
+    known_statuses = {"PENDING", "RUNNING", "SUCCEEDED", "FAILED", "STOPPED"}
+    matches = re.findall(r"\b([A-Z_]+)\b", output_text.upper())
+    for token in reversed(matches):
+        if token in known_statuses:
+            return token
+    return None
+
+
+def _parse_k8s_job_status(output_text: str) -> Tuple[str, Dict[str, Any]]:
+    payload = json.loads(output_text)
+    status = payload.get("status") or {}
+    conditions = {
+        str(item.get("type")): str(item.get("status"))
+        for item in (status.get("conditions") or [])
+        if item.get("type")
+    }
+    if conditions.get("Failed") == "True" or int(status.get("failed") or 0) > 0:
+        return "FAILED", payload
+    if conditions.get("Complete") == "True" or int(status.get("succeeded") or 0) > 0:
+        return "SUCCEEDED", payload
+    if int(status.get("active") or 0) > 0:
+        return "RUNNING", payload
+    return "PENDING", payload
+
+
+def _execute_basic_backend(
+    task: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, Any]:
+    command, launched_command = build_backend_command(
+        task,
+        None if target.get("name") == "local" else target,
+    )
+    result = _run_subprocess_command(command, cwd=task.get("cwd") or None)
+    result.update(
+        {
+            "launched_command": launched_command,
+            "assigned_target": target["name"],
+            "backend_type": (
+                "local"
+                if target.get("name") == "local"
+                else str((target.get("backend") or {}).get("type") or "local")
+            ),
+            "backend_handle": None,
+            "status_history": [],
+        }
+    )
+    return result
+
+
+def _execute_ray_job_backend(
+    task: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, Any]:
+    backend = dict(target["backend"])
+    submit_command, launched_command = build_backend_command(task, target)
+    submission_id = _ray_submission_id(task, backend)
+    status_history: List[Dict[str, Any]] = []
+    output_chunks: List[str] = []
+
+    submit_result = _run_subprocess_command(submit_command, cwd=task.get("cwd") or None)
+    output_chunks.append(submit_result["output_text"])
+    if submit_result["returncode"] != 0:
+        return {
+            "returncode": submit_result["returncode"],
+            "output_text": "".join(output_chunks),
+            "launched_command": launched_command,
+            "assigned_target": target["name"],
+            "backend_type": "ray_job",
+            "backend_handle": submission_id,
+            "status_history": status_history,
+        }
+
+    deadline = time.monotonic() + float(backend.get("timeout_s", 3600.0))
+    poll_interval_s = float(backend.get("poll_interval_s", 5.0))
+    terminal_status: Optional[str] = None
+    while True:
+        status_command = [
+            backend.get("ray_binary", "ray"),
+            *list(backend.get("ray_args") or []),
+            "job",
+            "status",
+            "--address",
+            backend["address"],
+            submission_id,
+        ]
+        status_result = _run_subprocess_command(
+            status_command,
+            cwd=task.get("cwd") or None,
+        )
+        output_chunks.append(status_result["output_text"])
+        status = _parse_ray_job_status(status_result["output_text"]) or "UNKNOWN"
+        status_history.append(
+            {
+                "status": status,
+                "command": shlex.join(status_command),
+                "returncode": status_result["returncode"],
+                "observed_at": _utc_now(),
+            }
+        )
+        if status_result["returncode"] != 0:
+            return {
+                "returncode": status_result["returncode"],
+                "output_text": "".join(output_chunks),
+                "launched_command": launched_command,
+                "assigned_target": target["name"],
+                "backend_type": "ray_job",
+                "backend_handle": submission_id,
+                "status_history": status_history,
+            }
+        if status in {"SUCCEEDED", "FAILED", "STOPPED"}:
+            terminal_status = status
+            break
+        if time.monotonic() >= deadline:
+            output_chunks.append(
+                f"\n[timeout] ray job {submission_id} exceeded {backend.get('timeout_s', 3600.0)}s\n"
+            )
+            return {
+                "returncode": 124,
+                "output_text": "".join(output_chunks),
+                "launched_command": launched_command,
+                "assigned_target": target["name"],
+                "backend_type": "ray_job",
+                "backend_handle": submission_id,
+                "status_history": status_history,
+            }
+        time.sleep(poll_interval_s)
+
+    if backend.get("collect_logs", True):
+        logs_command = [
+            backend.get("ray_binary", "ray"),
+            *list(backend.get("ray_args") or []),
+            "job",
+            "logs",
+            "--address",
+            backend["address"],
+            submission_id,
+        ]
+        logs_result = _run_subprocess_command(logs_command, cwd=task.get("cwd") or None)
+        output_chunks.append(logs_result["output_text"])
+
+    return {
+        "returncode": 0 if terminal_status == "SUCCEEDED" else 1,
+        "output_text": "".join(output_chunks),
         "launched_command": launched_command,
         "assigned_target": target["name"],
+        "backend_type": "ray_job",
+        "backend_handle": submission_id,
+        "status_history": status_history,
     }
+
+
+def _execute_k8s_job_backend(
+    task: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, Any]:
+    backend = dict(target["backend"])
+    create_command, launched_command = build_backend_command(task, target)
+    job_name = _k8s_job_name(task, backend)
+    namespace = backend.get("namespace")
+    kubectl_binary = backend.get("kubectl_binary", "kubectl")
+    status_history: List[Dict[str, Any]] = []
+    output_chunks: List[str] = []
+
+    create_result = _run_subprocess_command(create_command, cwd=task.get("cwd") or None)
+    output_chunks.append(create_result["output_text"])
+    if create_result["returncode"] != 0:
+        return {
+            "returncode": create_result["returncode"],
+            "output_text": "".join(output_chunks),
+            "launched_command": launched_command,
+            "assigned_target": target["name"],
+            "backend_type": "k8s_job",
+            "backend_handle": job_name,
+            "status_history": status_history,
+        }
+
+    deadline = time.monotonic() + float(backend.get("timeout_s", 3600.0))
+    poll_interval_s = float(backend.get("poll_interval_s", 5.0))
+    terminal_status: Optional[str] = None
+    while True:
+        get_command = [kubectl_binary, "get", "job", job_name, "-o", "json"]
+        if backend.get("kubectl_args"):
+            get_command = [
+                kubectl_binary,
+                *list(backend.get("kubectl_args") or []),
+                "get",
+                "job",
+                job_name,
+                "-o",
+                "json",
+            ]
+        if namespace:
+            get_command.extend(["--namespace", str(namespace)])
+        get_result = _run_subprocess_command(get_command, cwd=task.get("cwd") or None)
+        output_chunks.append(get_result["output_text"])
+        if get_result["returncode"] != 0:
+            return {
+                "returncode": get_result["returncode"],
+                "output_text": "".join(output_chunks),
+                "launched_command": launched_command,
+                "assigned_target": target["name"],
+                "backend_type": "k8s_job",
+                "backend_handle": job_name,
+                "status_history": status_history,
+            }
+        status, payload = _parse_k8s_job_status(get_result["output_text"])
+        status_history.append(
+            {
+                "status": status,
+                "command": shlex.join(get_command),
+                "observed_at": _utc_now(),
+                "raw_status": payload.get("status") or {},
+            }
+        )
+        if status in {"SUCCEEDED", "FAILED"}:
+            terminal_status = status
+            break
+        if time.monotonic() >= deadline:
+            output_chunks.append(
+                f"\n[timeout] k8s job {job_name} exceeded {backend.get('timeout_s', 3600.0)}s\n"
+            )
+            return {
+                "returncode": 124,
+                "output_text": "".join(output_chunks),
+                "launched_command": launched_command,
+                "assigned_target": target["name"],
+                "backend_type": "k8s_job",
+                "backend_handle": job_name,
+                "status_history": status_history,
+            }
+        time.sleep(poll_interval_s)
+
+    if backend.get("collect_logs", True):
+        logs_command = [kubectl_binary, "logs", f"job/{job_name}"]
+        if backend.get("kubectl_args"):
+            logs_command = [
+                kubectl_binary,
+                *list(backend.get("kubectl_args") or []),
+                "logs",
+                f"job/{job_name}",
+            ]
+        if namespace:
+            logs_command.extend(["--namespace", str(namespace)])
+        logs_result = _run_subprocess_command(logs_command, cwd=task.get("cwd") or None)
+        output_chunks.append(logs_result["output_text"])
+
+    if backend.get("cleanup", False):
+        delete_command = [kubectl_binary, "delete", "job", job_name]
+        if backend.get("kubectl_args"):
+            delete_command = [
+                kubectl_binary,
+                *list(backend.get("kubectl_args") or []),
+                "delete",
+                "job",
+                job_name,
+            ]
+        if namespace:
+            delete_command.extend(["--namespace", str(namespace)])
+        delete_result = _run_subprocess_command(
+            delete_command,
+            cwd=task.get("cwd") or None,
+        )
+        output_chunks.append(delete_result["output_text"])
+
+    return {
+        "returncode": 0 if terminal_status == "SUCCEEDED" else 1,
+        "output_text": "".join(output_chunks),
+        "launched_command": launched_command,
+        "assigned_target": target["name"],
+        "backend_type": "k8s_job",
+        "backend_handle": job_name,
+        "status_history": status_history,
+    }
+
+
+def _run_campaign_task(
+    task: Dict[str, Any],
+    target: Dict[str, Any],
+) -> Dict[str, Any]:
+    if target.get("name") == "local":
+        return _execute_basic_backend(task, target)
+    backend_type = str((target.get("backend") or {}).get("type") or "local")
+    if backend_type in {"template", "ssh", "local"}:
+        return _execute_basic_backend(task, target)
+    if backend_type == "ray_job":
+        return _execute_ray_job_backend(task, target)
+    if backend_type == "k8s_job":
+        return _execute_k8s_job_backend(task, target)
+    raise ValueError(f"Unsupported backend type for execution: {backend_type}")
 
 
 def execute_campaign_plan(
@@ -1194,6 +1506,9 @@ def execute_campaign_plan(
                             task_id,
                             "failed",
                             assigned_target=result["assigned_target"],
+                            backend_type=result.get("backend_type"),
+                            backend_handle=result.get("backend_handle"),
+                            status_history=result.get("status_history"),
                             launched_command=result["launched_command"],
                             returncode=result["returncode"],
                             output_path=task["output_path"],
@@ -1210,12 +1525,17 @@ def execute_campaign_plan(
                             "output_path": task["output_path"],
                             "log_path": task["log_path"],
                             "assigned_target": result["assigned_target"],
+                            "backend_type": result.get("backend_type"),
+                            "backend_handle": result.get("backend_handle"),
                         }
                     )
                     _update_task_state(
                         task_id,
                         "completed",
                         assigned_target=result["assigned_target"],
+                        backend_type=result.get("backend_type"),
+                        backend_handle=result.get("backend_handle"),
+                        status_history=result.get("status_history"),
                         launched_command=result["launched_command"],
                         returncode=result["returncode"],
                         output_path=task["output_path"],
