@@ -29,11 +29,32 @@ import statistics
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 import ray
 from ray.data import DataContext, Dataset
+
+try:
+    from ray.data.benchmarks import cbo_benchmark_campaign as benchmark_campaign
+    from ray.data.benchmarks import cbo_benchmark_harness as benchmark_harness
+    from ray.data.benchmarks import cbo_benchmark_postprocess as benchmark_postprocess
+    from ray.data.benchmarks.cbo_benchmark_schema import (
+        build_end_to_end_payload,
+        build_memory_profile_payload,
+        build_per_rule_payload,
+        build_r_value_matrix_payload,
+    )
+except ImportError:
+    import cbo_benchmark_campaign as benchmark_campaign  # type: ignore
+    import cbo_benchmark_harness as benchmark_harness  # type: ignore
+    import cbo_benchmark_postprocess as benchmark_postprocess  # type: ignore
+    from cbo_benchmark_schema import (  # type: ignore
+        build_end_to_end_payload,
+        build_memory_profile_payload,
+        build_per_rule_payload,
+        build_r_value_matrix_payload,
+    )
 
 # ---------------------------------------------------------------------------
 # CBO statistics module import (from local source via importlib so it works
@@ -341,40 +362,87 @@ def build_streaming_dataset(num_rows: int) -> Dataset:
     return ds
 
 
+def _light_chain_udf(batch: Dict[str, "np.ndarray"]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"id": batch["id"] * 2 + 1}
+    if "payload" in batch:
+        out["payload"] = batch["payload"]
+    return out
+
+
+def _heavy_chain_udf(batch: Dict[str, "np.ndarray"]) -> Dict[str, Any]:
+    import numpy as np
+
+    arr = batch["id"].astype(np.float64)
+    for _ in range(8):
+        arr = np.sin(arr) * np.cos(arr) + np.sqrt(np.abs(arr) + 1)
+    out: Dict[str, Any] = {"id": arr}
+    if "payload" in batch:
+        out["payload"] = batch["payload"]
+    return out
+
+
+def _attach_payload(
+    batch: Dict[str, "np.ndarray"],
+    payload_bytes_per_row: int,
+) -> Dict[str, Any]:
+    import numpy as np
+
+    payload_prefix = b"x" * max(payload_bytes_per_row - 8, 0)
+    payload = np.asarray(
+        [
+            payload_prefix + int(value).to_bytes(8, "little", signed=False)
+            for value in batch["id"]
+        ],
+        dtype=object,
+    )
+    return {"id": batch["id"], "payload": payload}
+
+
+def _parameterized_pipeline_desc(transform_ops: int, payload_bytes_per_row: int) -> str:
+    payload_desc = (
+        f"payload({payload_bytes_per_row}B)->" if payload_bytes_per_row > 0 else ""
+    )
+    return (
+        f"range->filter->{payload_desc}map_batches*x{transform_ops}->"
+        "repartition->sort"
+    )
+
+
+def _estimate_chain_data_scale_bytes(
+    num_rows: int,
+    payload_bytes_per_row: int,
+) -> int:
+    return num_rows * (8 + max(payload_bytes_per_row, 0))
+
+
+def build_parameterized_chain_dataset(
+    num_rows: int,
+    transform_ops: int,
+    payload_bytes_per_row: int = 0,
+) -> Dataset:
+    ds = ray.data.range(num_rows)
+    ds = ds.filter(lambda row: row["id"] % 3 == 0)
+    if payload_bytes_per_row > 0:
+        ds = ds.map_batches(
+            _attach_payload,
+            fn_kwargs={"payload_bytes_per_row": payload_bytes_per_row},
+            batch_size=1024,
+            batch_format="numpy",
+        )
+    for idx in range(transform_ops):
+        ds = ds.map_batches(
+            _heavy_chain_udf if idx % 2 else _light_chain_udf,
+            batch_size=1024,
+            batch_format="numpy",
+        )
+    ds = ds.repartition(max(8, min(64, max(transform_ops, 1) * 8)))
+    ds = ds.sort(key="id")
+    return ds
+
+
 # ---------------------------------------------------------------------------
 # Metrics collection
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class OperatorMetrics:
-    """Per-operator stats collected after execution."""
-
-    operator: str = ""
-    time_total_s: float = 0.0
-    output_rows: int = 0
-    throughput_rows_per_s: float = 0.0
-
-
-@dataclass
-class RunMetrics:
-    """All metrics collected for a single benchmark run."""
-
-    mode: str = ""                      # "batch" | "streaming"
-    enable_cbo: bool = False
-    duration_s: float = 0.0
-    reservation_ratio: float = 0.5
-    operator_count: int = 0
-    operators: List[Dict[str, Any]] = field(default_factory=list)
-    global_bytes_spilled: int = 0
-    dataset_bytes_spilled: int = 0
-    streaming_schedule_s: float = 0.0
-    total_input_rows: int = 0
-    # Streaming latency percentiles (only for streaming mode)
-    latency_p50_ms: float = 0.0
-    latency_p95_ms: float = 0.0
-    latency_p99_ms: float = 0.0
-    latency_mean_ms: float = 0.0
 
 
 def _summarize_stats(
@@ -383,7 +451,7 @@ def _summarize_stats(
     mode: str,
     enable_cbo: bool,
     batch_latencies: Optional[List[float]] = None,
-) -> RunMetrics:
+) -> benchmark_harness.RunMetrics:
     """Extract execution stats from the materialised dataset.
 
     Handles missing or ``None`` stat fields gracefully so the benchmark can
@@ -392,7 +460,7 @@ def _summarize_stats(
     plan = getattr(ds, "_plan", None)
     if plan is None:
         # Fallback: return a bare RunMetrics with just timing
-        return RunMetrics(
+        return benchmark_harness.RunMetrics(
             mode=mode,
             enable_cbo=enable_cbo,
             duration_s=round(duration_s, 4),
@@ -402,7 +470,7 @@ def _summarize_stats(
         plan_stats = plan.stats()
         summary = plan_stats.to_summary()
     except Exception:
-        return RunMetrics(
+        return benchmark_harness.RunMetrics(
             mode=mode,
             enable_cbo=enable_cbo,
             duration_s=round(duration_s, 4),
@@ -442,7 +510,17 @@ def _summarize_stats(
         p99 = sorted_lats[min(int(n * 0.99), n - 1)] * 1000
         mean_lat = statistics.mean(batch_latencies) * 1000
 
-    return RunMetrics(
+    peak_heap_bytes = None
+    try:
+        peak_heap_mib = summary.get_max_heap_memory()
+        if peak_heap_mib:
+            peak_heap_bytes = int(float(peak_heap_mib) * 1024 * 1024)
+    except Exception:
+        peak_heap_bytes = None
+
+    peak_object_store_bytes = _get_peak_object_store_bytes(summary)
+
+    return benchmark_harness.RunMetrics(
         mode=mode,
         enable_cbo=enable_cbo,
         duration_s=round(duration_s, 4),
@@ -459,6 +537,8 @@ def _summarize_stats(
         latency_p95_ms=round(p95, 3),
         latency_p99_ms=round(p99, 3),
         latency_mean_ms=round(mean_lat, 3),
+        peak_object_store_bytes=peak_object_store_bytes,
+        peak_heap_bytes=peak_heap_bytes,
     )
 
 
@@ -467,7 +547,32 @@ def _summarize_stats(
 # ---------------------------------------------------------------------------
 
 
-def _configure_context(streaming: bool, enable_cbo: bool) -> DataContext:
+def _get_peak_object_store_bytes(summary) -> Optional[int]:
+    peak = 0
+
+    def _visit(node) -> None:
+        nonlocal peak
+        if node is None:
+            return
+        extra_metrics = getattr(node, "extra_metrics", None) or {}
+        current = extra_metrics.get("obj_store_mem_used", 0)
+        try:
+            peak = max(peak, int(current or 0))
+        except Exception:
+            pass
+        for parent in getattr(node, "parents", []) or []:
+            _visit(parent)
+
+    _visit(summary)
+    return peak or None
+
+
+def _configure_context(
+    streaming: bool,
+    enable_cbo: bool,
+    forced_reservation_ratio: Optional[float] = None,
+    memory_poll_interval_s: Optional[float] = None,
+) -> DataContext:
     """Create a context with CBO toggled on/off.
 
     Gracefully handles the case where the running Ray version does not yet
@@ -484,6 +589,14 @@ def _configure_context(streaming: bool, enable_cbo: bool) -> DataContext:
         ctx._user_set_reservation_ratio = False
     except (AttributeError, TypeError):
         setattr(ctx, "_user_set_reservation_ratio", False)
+    if forced_reservation_ratio is not None:
+        ctx.op_resource_reservation_ratio = forced_reservation_ratio
+        try:
+            ctx._user_set_reservation_ratio = True
+        except (AttributeError, TypeError):
+            setattr(ctx, "_user_set_reservation_ratio", True)
+    if memory_poll_interval_s is not None and hasattr(ctx, "memory_usage_poll_interval_s"):
+        ctx.memory_usage_poll_interval_s = memory_poll_interval_s
     ctx.execution_options.verbose_progress = False
     return ctx
 
@@ -515,7 +628,10 @@ def _context_scope(ctx: DataContext):
 # ---------------------------------------------------------------------------
 
 
-def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
+def run_batch_workload(
+    num_rows: int,
+    enable_cbo: bool,
+) -> benchmark_harness.RunMetrics:
     """Execute the batch pipeline with or without CBO."""
     ctx = _configure_context(streaming=False, enable_cbo=enable_cbo)
     with _context_scope(ctx):
@@ -526,7 +642,10 @@ def run_batch_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
         return _summarize_stats(ds, duration, mode="batch", enable_cbo=enable_cbo)
 
 
-def run_streaming_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
+def run_streaming_workload(
+    num_rows: int,
+    enable_cbo: bool,
+) -> benchmark_harness.RunMetrics:
     """Execute the streaming pipeline with or without CBO, measuring per-batch latency."""
     ctx = _configure_context(streaming=True, enable_cbo=enable_cbo)
     with _context_scope(ctx):
@@ -553,125 +672,341 @@ def run_streaming_workload(num_rows: int, enable_cbo: bool) -> RunMetrics:
         return metrics
 
 
+def run_parameterized_workload(
+    num_rows: int,
+    transform_ops: int,
+    enable_cbo: bool,
+    payload_bytes_per_row: int = 0,
+    forced_reservation_ratio: Optional[float] = None,
+    memory_poll_interval_s: Optional[float] = None,
+) -> benchmark_harness.RunMetrics:
+    workload_id = f"chain_rows{num_rows}_ops{transform_ops}"
+    plan_description = _parameterized_pipeline_desc(
+        transform_ops=transform_ops,
+        payload_bytes_per_row=payload_bytes_per_row,
+    )
+    ctx = _configure_context(
+        streaming=False,
+        enable_cbo=enable_cbo,
+        forced_reservation_ratio=forced_reservation_ratio,
+        memory_poll_interval_s=memory_poll_interval_s,
+    )
+    with _context_scope(ctx):
+        ds = build_parameterized_chain_dataset(
+            num_rows=num_rows,
+            transform_ops=transform_ops,
+            payload_bytes_per_row=payload_bytes_per_row,
+        )
+        start = time.perf_counter()
+        ds = ds.materialize()
+        duration = time.perf_counter() - start
+        metrics = _summarize_stats(
+            ds,
+            duration,
+            mode="batch",
+            enable_cbo=enable_cbo,
+        )
+        metrics.workload_id = workload_id
+        metrics.plan_description = plan_description
+        metrics.total_input_rows = num_rows
+        metrics.data_scale_bytes = _estimate_chain_data_scale_bytes(
+            num_rows=num_rows,
+            payload_bytes_per_row=payload_bytes_per_row,
+        )
+        metrics.metadata.update(
+            {
+                "transform_ops": transform_ops,
+                "payload_bytes_per_row": payload_bytes_per_row,
+                "pipeline_desc": plan_description,
+            }
+        )
+        return metrics
+
+
+def _aggregate_repeated_runs(
+    runs: List[benchmark_harness.RunMetrics],
+) -> benchmark_harness.RunMetrics:
+    if not runs:
+        raise ValueError("runs must not be empty")
+    first = runs[0]
+    return benchmark_harness.RunMetrics(
+        workload_id=first.workload_id,
+        plan_description=first.plan_description,
+        mode=first.mode,
+        enable_cbo=first.enable_cbo,
+        duration_s=round(statistics.mean(run.duration_s for run in runs), 4),
+        reservation_ratio=round(
+            statistics.mean(run.reservation_ratio for run in runs),
+            4,
+        ),
+        operator_count=first.operator_count,
+        operators=first.operators,
+        global_bytes_spilled=int(
+            statistics.mean(run.global_bytes_spilled for run in runs)
+        ),
+        dataset_bytes_spilled=int(
+            statistics.mean(run.dataset_bytes_spilled for run in runs)
+        ),
+        streaming_schedule_s=round(
+            statistics.mean(run.streaming_schedule_s for run in runs),
+            4,
+        ),
+        total_input_rows=first.total_input_rows,
+        latency_p50_ms=round(statistics.mean(run.latency_p50_ms for run in runs), 3),
+        latency_p95_ms=round(statistics.mean(run.latency_p95_ms for run in runs), 3),
+        latency_p99_ms=round(statistics.mean(run.latency_p99_ms for run in runs), 3),
+        latency_mean_ms=round(statistics.mean(run.latency_mean_ms for run in runs), 3),
+        data_scale_bytes=first.data_scale_bytes,
+        peak_object_store_bytes=max(
+            run.peak_object_store_bytes or 0 for run in runs
+        )
+        or None,
+        peak_heap_bytes=max(run.peak_heap_bytes or 0 for run in runs) or None,
+        metadata=dict(first.metadata),
+    )
+
+
+def run_r_value_matrix_experiment(
+    workloads: List[benchmark_harness.ParameterizedWorkloadCase],
+    sweep_ratios: List[float],
+    repetitions: int,
+    subtask_index: Optional[int] = None,
+    subtask_count: Optional[int] = None,
+    log_fn=print,
+) -> List[benchmark_harness.RValueMatrixResult]:
+    default_ratio = 0.5
+    results: List[benchmark_harness.RValueMatrixResult] = []
+    for workload in workloads:
+        log_fn(
+            f"[r-matrix] {workload.workload_id} rows={workload.num_rows} "
+            f"ops={workload.transform_ops}"
+        )
+        derived_runs = [
+            run_parameterized_workload(
+                num_rows=workload.num_rows,
+                transform_ops=workload.transform_ops,
+                enable_cbo=True,
+            )
+            for _ in range(repetitions)
+        ]
+        derived_metrics = _aggregate_repeated_runs(derived_runs)
+        sweep_detail: List[Dict[str, Any]] = []
+        for ratio in sweep_ratios:
+            manual_runs = [
+                run_parameterized_workload(
+                    num_rows=workload.num_rows,
+                    transform_ops=workload.transform_ops,
+                    enable_cbo=False,
+                    forced_reservation_ratio=ratio,
+                )
+                for _ in range(repetitions)
+            ]
+            manual_metrics = _aggregate_repeated_runs(manual_runs)
+            sweep_detail.append(
+                {
+                    "ratio": ratio,
+                    "time_s": round(manual_metrics.duration_s, 4),
+                    "spill_bytes": max(
+                        manual_metrics.global_bytes_spilled,
+                        manual_metrics.dataset_bytes_spilled,
+                    ),
+                    "peak_heap_bytes": manual_metrics.peak_heap_bytes,
+                    "peak_object_store_bytes": manual_metrics.peak_object_store_bytes,
+                    "is_default": abs(ratio - default_ratio) < 1e-9,
+                }
+            )
+
+        best = min(sweep_detail, key=lambda entry: entry["time_s"])
+        default_entry = next(
+            (
+                entry
+                for entry in sweep_detail
+                if abs(entry["ratio"] - default_ratio) < 1e-9
+            ),
+            sweep_detail[0],
+        )
+        results.append(
+            benchmark_harness.RValueMatrixResult(
+                workload_id=workload.workload_id,
+                num_rows=workload.num_rows,
+                transform_ops=workload.transform_ops,
+                derived_ratio=float(derived_metrics.reservation_ratio),
+                derived_duration_s=derived_metrics.duration_s,
+                best_ratio=float(best["ratio"]),
+                best_duration_s=float(best["time_s"]),
+                default_ratio=default_ratio,
+                default_duration_s=float(default_entry["time_s"]),
+                r_error=round(
+                    abs(float(derived_metrics.reservation_ratio) - float(best["ratio"])),
+                    4,
+                ),
+                operator_count=derived_metrics.operator_count,
+                data_scale_bytes=derived_metrics.data_scale_bytes,
+                peak_object_store_bytes=derived_metrics.peak_object_store_bytes,
+                peak_heap_bytes=derived_metrics.peak_heap_bytes,
+                spill_bytes=max(
+                    derived_metrics.global_bytes_spilled,
+                    derived_metrics.dataset_bytes_spilled,
+                ),
+                pipeline_desc=workload.description,
+                sweep_detail=sweep_detail,
+                subtask_index=subtask_index,
+                subtask_count=subtask_count,
+            )
+        )
+    return results
+
+
+def run_memory_profile_experiment(
+    plan: List[benchmark_harness.ParameterizedExecutionCase],
+    repetitions: int,
+    memory_poll_interval_s: float,
+    subtask_index: Optional[int] = None,
+    subtask_count: Optional[int] = None,
+    preset_name: Optional[str] = None,
+    log_fn=print,
+) -> List[benchmark_harness.RunMetrics]:
+    results: List[benchmark_harness.RunMetrics] = []
+    for case in plan:
+        cbo_label = "ON" if case.cbo_enabled else "OFF"
+        log_fn(
+            f"[rep {case.repetition}/{repetitions}] "
+            f"{case.workload_id} memory-profile CBO={cbo_label}"
+        )
+        results.append(
+            run_parameterized_workload(
+                num_rows=case.num_rows,
+                transform_ops=case.transform_ops,
+                enable_cbo=case.cbo_enabled,
+                payload_bytes_per_row=case.payload_bytes_per_row,
+                memory_poll_interval_s=memory_poll_interval_s,
+            )
+        )
+        results[-1].metadata.update(
+            {
+                "run_id": case.run_id,
+                "repetition": case.repetition,
+                "run_group_id": f"{case.workload_id}:rep{case.repetition}",
+                "subtask_index": subtask_index,
+                "subtask_count": subtask_count,
+                "preset_name": preset_name,
+            }
+        )
+    return results
+
+
+def _parse_int_list(raw: str) -> List[int]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("expected at least one integer value")
+    return [int(value) for value in values]
+
+
+def _parse_float_list(raw: str) -> List[float]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("expected at least one float value")
+    return [float(value) for value in values]
+
+
+def _resolve_profile_inputs(args) -> Dict[str, Any]:
+    operator_counts = _parse_int_list(args.profile_operator_counts)
+    if args.profile_preset:
+        return benchmark_harness.resolve_memory_profile_preset(
+            args.profile_preset,
+            operator_counts=operator_counts,
+        )
+
+    return {
+        "preset_name": None,
+        "row_counts": _parse_int_list(args.profile_row_scales),
+        "operator_counts": operator_counts,
+        "payload_bytes_per_row": args.payload_bytes_per_row,
+        "target_total_bytes": None,
+        "target_rows": None,
+        "description": None,
+    }
+
+
+def _write_subtask_manifest(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
+
+def _write_markdown_report(
+    path: str,
+    payload: Dict[str, Any],
+    title: Optional[str],
+    feedback_alpha: float,
+    feedback_tolerance: float,
+    feedback_max_iterations: int,
+) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    benchmark_postprocess.write_markdown_report(
+        path,
+        payload,
+        title=title,
+        runtime_feedback_alpha=feedback_alpha,
+        runtime_feedback_tolerance=feedback_tolerance,
+        runtime_feedback_max_iterations=feedback_max_iterations,
+    )
+
+
+def _write_publication_bundle(
+    output_dir: str,
+    payload: Dict[str, Any],
+    title: Optional[str],
+    environment_metadata: Optional[Dict[str, Any]],
+    input_result_paths: Optional[List[str]],
+    manifest_path: Optional[str],
+    feedback_alpha: float,
+    feedback_tolerance: float,
+    feedback_max_iterations: int,
+) -> Dict[str, Any]:
+    return benchmark_postprocess.write_publication_bundle(
+        output_dir,
+        payload,
+        title=title,
+        environment_metadata=environment_metadata,
+        input_result_paths=input_result_paths,
+        manifest_path=manifest_path,
+        runtime_feedback_alpha=feedback_alpha,
+        runtime_feedback_tolerance=feedback_tolerance,
+        runtime_feedback_max_iterations=feedback_max_iterations,
+    )
+
+
+def _parse_str_list(raw: str) -> List[str]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("expected at least one non-empty path")
+    return values
+
+
+def _load_str_list_file(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("input-results-file must contain a non-empty JSON list")
+    values = [str(item).strip() for item in payload if str(item).strip()]
+    if not values:
+        raise ValueError("input-results-file must contain at least one non-empty path")
+    return values
+
+
+def _ensure_parent_dir(path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Aggregation & reporting
 # ---------------------------------------------------------------------------
 
 
-def aggregate_runs(runs: List[RunMetrics]) -> Dict[str, Dict[str, Any]]:
-    """Group runs by (mode, enable_cbo) and compute summary statistics."""
-    grouped: Dict[str, List[RunMetrics]] = {}
-    for run in runs:
-        key = f"{run.mode}-cbo-{run.enable_cbo}"
-        grouped.setdefault(key, []).append(run)
-
-    aggregates: Dict[str, Dict[str, Any]] = {}
-    for key, values in grouped.items():
-        durations = [v.duration_s for v in values]
-        agg: Dict[str, Any] = {
-            "runs": len(values),
-            "duration_s_mean": round(statistics.mean(durations), 4),
-            "duration_s_stdev": round(statistics.pstdev(durations), 4),
-            "reservation_ratio_mean": round(
-                statistics.mean(v.reservation_ratio for v in values), 4
-            ),
-            "operator_count": values[0].operator_count,
-            "global_bytes_spilled_mean": int(
-                statistics.mean(v.global_bytes_spilled for v in values)
-            ),
-            "dataset_bytes_spilled_mean": int(
-                statistics.mean(v.dataset_bytes_spilled for v in values)
-            ),
-        }
-        # Streaming-specific aggregates
-        if values[0].mode == "streaming":
-            agg["latency_p50_ms_mean"] = round(
-                statistics.mean(v.latency_p50_ms for v in values), 3
-            )
-            agg["latency_p95_ms_mean"] = round(
-                statistics.mean(v.latency_p95_ms for v in values), 3
-            )
-            agg["latency_p99_ms_mean"] = round(
-                statistics.mean(v.latency_p99_ms for v in values), 3
-            )
-        aggregates[key] = agg
-    return aggregates
-
-
-def _format_comparison(aggregates: Dict[str, Dict[str, Any]]) -> str:
-    """Produce a human-readable comparison table."""
-    lines: List[str] = []
-    lines.append("=" * 72)
-    lines.append("  Ray Data CBO Benchmark Results")
-    lines.append("=" * 72)
-
-    for mode in ("batch", "streaming"):
-        off_key = f"{mode}-cbo-False"
-        on_key = f"{mode}-cbo-True"
-        off = aggregates.get(off_key, {})
-        on = aggregates.get(on_key, {})
-        if not off or not on:
-            continue
-
-        lines.append(f"\n  [{mode.upper()}]")
-        lines.append(f"  {'Metric':<35} {'CBO OFF':>12} {'CBO ON':>12} {'Delta':>10}")
-        lines.append(f"  {'-'*35} {'-'*12} {'-'*12} {'-'*10}")
-
-        dur_off = off["duration_s_mean"]
-        dur_on = on["duration_s_mean"]
-        delta_pct = ((dur_on - dur_off) / dur_off * 100) if dur_off > 0 else 0
-        lines.append(
-            f"  {'Duration (s)':<35} {dur_off:>12.3f} {dur_on:>12.3f} "
-            f"{delta_pct:>+9.1f}%"
-        )
-
-        lines.append(
-            f"  {'Reservation Ratio':<35} "
-            f"{off['reservation_ratio_mean']:>12.3f} "
-            f"{on['reservation_ratio_mean']:>12.3f}"
-        )
-
-        spill_off = off["global_bytes_spilled_mean"]
-        spill_on = on["global_bytes_spilled_mean"]
-        lines.append(
-            f"  {'Global Spill (MB)':<35} "
-            f"{spill_off / (1024**2):>12.1f} "
-            f"{spill_on / (1024**2):>12.1f}"
-        )
-
-        if mode == "streaming":
-            for pct in ("p50", "p95", "p99"):
-                key_name = f"latency_{pct}_ms_mean"
-                v_off = off.get(key_name, 0)
-                v_on = on.get(key_name, 0)
-                lines.append(
-                    f"  {'Latency ' + pct + ' (ms)':<35} "
-                    f"{v_off:>12.3f} {v_on:>12.3f}"
-                )
-
-    lines.append("\n" + "=" * 72)
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Per-rule benchmark framework
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class RuleBenchResult:
-    """Result of a single per-rule benchmark."""
-
-    rule_name: str
-    rule_category: str  # "RBO" | "CBO"
-    optimization_goal: str  # "Throughput" | "Resource"
-    pipeline_desc: str
-    baseline_label: str
-    optimized_label: str
-    baseline_time_s: float
-    optimized_time_s: float
-    improvement_pct: float  # positive => faster
-    sweep_detail: Optional[List[Dict[str, Any]]] = None
 
 
 def _timed_materialize(build_fn, reps: int = 1) -> float:
@@ -721,7 +1056,10 @@ def _extra_heavy_udf(batch):
 # ---- individual rule benchmarks ------------------------------------------
 
 
-def bench_operator_fusion(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_operator_fusion(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """OperatorFusion: fused vs unfused map chain."""
     from ray.data._internal.logical.rules.operator_fusion import FuseOperators
 
@@ -735,7 +1073,7 @@ def bench_operator_fusion(num_rows: int, reps: int) -> RuleBenchResult:
         t_off = _timed_materialize(build, reps)
     t_on = _timed_materialize(build, reps)
     imp = (t_off - t_on) / t_off * 100 if t_off > 0 else 0
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="OperatorFusion", rule_category="RBO",
         optimization_goal="Throughput",
         pipeline_desc="range->map(x2)->map(+1)->map(heavy)",
@@ -745,7 +1083,10 @@ def bench_operator_fusion(num_rows: int, reps: int) -> RuleBenchResult:
     )
 
 
-def bench_predicate_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_predicate_pushdown(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """PredicatePushdown: filter-late vs filter-early.
 
     Uses an extra-heavy UDF so that the computation gap between
@@ -766,7 +1107,7 @@ def bench_predicate_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
     t_late = _timed_materialize(build_late, reps)
     t_early = _timed_materialize(build_early, reps)
     imp = (t_late - t_early) / t_late * 100 if t_late > 0 else 0
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="PredicatePushdown", rule_category="RBO",
         optimization_goal="Throughput",
         pipeline_desc="range->[filter <-> map(heavy)]",
@@ -776,7 +1117,10 @@ def bench_predicate_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
     )
 
 
-def bench_limit_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_limit_pushdown(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """LimitPushdown: limit-late vs limit-early.
 
     The baseline places a sort (AllToAll) before the limit, forcing full
@@ -801,7 +1145,7 @@ def bench_limit_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
     t_late = _timed_materialize(build_late, reps)
     t_early = _timed_materialize(build_early, reps)
     imp = (t_late - t_early) / t_late * 100 if t_late > 0 else 0
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="LimitPushdown", rule_category="RBO",
         optimization_goal="Throughput",
         pipeline_desc=f"range({num_rows})->[limit({limit_n}) <-> map+sort]",
@@ -812,7 +1156,10 @@ def bench_limit_pushdown(num_rows: int, reps: int) -> RuleBenchResult:
     )
 
 
-def bench_combine_shuffles(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_combine_shuffles(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """CombineShuffles: two consecutive repartitions vs one.
 
     A map_batches is placed before the repartitions so the total pipeline
@@ -834,7 +1181,7 @@ def bench_combine_shuffles(num_rows: int, reps: int) -> RuleBenchResult:
     t_double = _timed_materialize(build_double, reps)
     t_single = _timed_materialize(build_single, reps)
     imp = (t_double - t_single) / t_double * 100 if t_double > 0 else 0
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="CombineShuffles", rule_category="RBO",
         optimization_goal="Throughput",
         pipeline_desc="map->repart(32)->repart(16) vs map->repart(16)",
@@ -844,7 +1191,10 @@ def bench_combine_shuffles(num_rows: int, reps: int) -> RuleBenchResult:
     )
 
 
-def bench_reservation_ratio(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_reservation_ratio(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """DeriveReservationRatio: sweep reservation-ratio on a sort pipeline."""
     ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
     default_r = 0.5
@@ -867,7 +1217,7 @@ def bench_reservation_ratio(num_rows: int, reps: int) -> RuleBenchResult:
     dflt = next(e for e in sweep if e["is_default"])
     imp = ((dflt["time_s"] - best["time_s"]) / dflt["time_s"] * 100
            if dflt["time_s"] > 0 else 0)
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="DeriveReservationRatio", rule_category="CBO",
         optimization_goal="Resource",
         pipeline_desc="filter->map->sort @ sweep R",
@@ -878,7 +1228,10 @@ def bench_reservation_ratio(num_rows: int, reps: int) -> RuleBenchResult:
     )
 
 
-def bench_shuffle_partitions(num_rows: int, reps: int) -> RuleBenchResult:
+def bench_shuffle_partitions(
+    num_rows: int,
+    reps: int,
+) -> benchmark_harness.RuleBenchResult:
     """DeriveShufflePartitions: sweep partition counts for repartition."""
     counts = [4, 8, 16, 32, 64, 128]
     default_n = 64
@@ -897,7 +1250,7 @@ def bench_shuffle_partitions(num_rows: int, reps: int) -> RuleBenchResult:
     dflt = next(e for e in sweep if e["is_default"])
     imp = ((dflt["time_s"] - best["time_s"]) / dflt["time_s"] * 100
            if dflt["time_s"] > 0 else 0)
-    return RuleBenchResult(
+    return benchmark_harness.RuleBenchResult(
         rule_name="DeriveShufflePartitions", rule_category="CBO",
         optimization_goal="Resource",
         pipeline_desc="map->repart(N) @ sweep N",
@@ -910,128 +1263,49 @@ def bench_shuffle_partitions(num_rows: int, reps: int) -> RuleBenchResult:
 
 # ---- registry & orchestrator ---------------------------------------------
 
-ALL_RULE_BENCHMARKS = [
-    ("OperatorFusion", bench_operator_fusion),
-    ("PredicatePushdown", bench_predicate_pushdown),
-    ("LimitPushdown", bench_limit_pushdown),
-    ("CombineShuffles", bench_combine_shuffles),
-    ("DeriveReservationRatio", bench_reservation_ratio),
-    ("DeriveShufflePartitions", bench_shuffle_partitions),
+RULE_BENCHMARK_CASES = [
+    benchmark_harness.RuleBenchmarkCase(
+        name="OperatorFusion",
+        category="RBO",
+        optimization_goal="Throughput",
+        runner=bench_operator_fusion,
+    ),
+    benchmark_harness.RuleBenchmarkCase(
+        name="PredicatePushdown",
+        category="RBO",
+        optimization_goal="Throughput",
+        runner=bench_predicate_pushdown,
+    ),
+    benchmark_harness.RuleBenchmarkCase(
+        name="LimitPushdown",
+        category="RBO",
+        optimization_goal="Throughput",
+        runner=bench_limit_pushdown,
+    ),
+    benchmark_harness.RuleBenchmarkCase(
+        name="CombineShuffles",
+        category="RBO",
+        optimization_goal="Throughput",
+        runner=bench_combine_shuffles,
+    ),
+    benchmark_harness.RuleBenchmarkCase(
+        name="DeriveReservationRatio",
+        category="CBO",
+        optimization_goal="Resource",
+        runner=bench_reservation_ratio,
+    ),
+    benchmark_harness.RuleBenchmarkCase(
+        name="DeriveShufflePartitions",
+        category="CBO",
+        optimization_goal="Resource",
+        runner=bench_shuffle_partitions,
+    ),
 ]
 
-
-def run_per_rule_benchmarks(
-    num_rows: int,
-    reps: int,
-    warmup: bool = False,
-    rules: Optional[List[str]] = None,
-) -> List[RuleBenchResult]:
-    """Execute per-rule benchmarks and return ordered results."""
-    selected = ALL_RULE_BENCHMARKS
-    if rules:
-        wanted = {r.lower() for r in rules}
-        selected = [
-            (n, f) for n, f in ALL_RULE_BENCHMARKS if n.lower() in wanted
-        ]
-    if warmup:
-        print("\n[warmup] Running warmup pipeline ...")
-        ray.data.range(min(num_rows, 50_000)).map_batches(
-            lambda b: b, batch_format="numpy",
-        ).materialize()
-        print("[warmup] Done.\n")
-    results: List[RuleBenchResult] = []
-    for name, fn in selected:
-        print(f"  [{name}] Running ...")
-        try:
-            r = fn(num_rows, reps)
-            results.append(r)
-            print(
-                f"  [{name}] baseline={r.baseline_time_s:.3f}s  "
-                f"optimized={r.optimized_time_s:.3f}s  "
-                f"delta={r.improvement_pct:+.1f}%"
-            )
-        except Exception as exc:
-            print(f"  [{name}] FAILED: {exc}")
-    return results
-
-
-# ---- structured table output ----------------------------------------------
-
-
-def _fmt_sweep(
-    entries: List[Dict[str, Any]], key: str, label: str,
-) -> List[str]:
-    """Format a parameter-sweep sub-table."""
-    lines: List[str] = []
-    default_t = next(e["time_s"] for e in entries if e["is_default"])
-    best_t = min(e["time_s"] for e in entries)
-    lines.append(f"    {label:<12} {'Time (s)':>10}  {'vs Default':>12}")
-    lines.append(f"    {'---' * 13}")
-    for e in entries:
-        val = e[key]
-        delta = (
-            (e["time_s"] - default_t) / default_t * 100
-            if default_t > 0 else 0
-        )
-        tag = "  (default)" if e["is_default"] else ""
-        if e["time_s"] == best_t and not e["is_default"]:
-            tag = "  <- best"
-        fmt_val = f"{val:.2f}" if isinstance(val, float) else str(val)
-        lines.append(
-            f"    {fmt_val:<12} {e['time_s']:>10.3f}  {delta:>+11.1f}%{tag}"
-        )
-    return lines
-
-
-def format_rule_results_table(
-    results: List[RuleBenchResult], num_rows: int, reps: int,
-) -> str:
-    """Return a structured report of per-rule benchmark results."""
-    W = 88
-    sep = "=" * W
-    lines: List[str] = [
-        sep,
-        "  Ray Data Optimization Rules - Per-Rule Benchmark Results",
-        sep,
-        f"  Config: {num_rows:,} rows x {reps} rep(s)\n",
-    ]
-    # summary table
-    hdr = (
-        f"  {'Rule':<26} {'Type':>4}  {'Goal':<11}"
-        f"{'Baseline':>10} {'Optimized':>10} {'Improv.':>9}"
-    )
-    lines.append(hdr)
-    lines.append(f"  {'-' * (W - 4)}")
-    for r in results:
-        arrow = "+" if r.improvement_pct >= 0 else "-"
-        lines.append(
-            f"  {r.rule_name:<26} {r.rule_category:>4}  "
-            f"{r.optimization_goal:<11}"
-            f"{r.baseline_time_s:>9.3f}s {r.optimized_time_s:>9.3f}s "
-            f"{arrow}{abs(r.improvement_pct):>7.1f}%"
-        )
-    lines.append(f"  {'-' * (W - 4)}")
-    # legend
-    lines.append("\n  Legend:")
-    for r in results:
-        lines.append(f"    {r.rule_name:<26} {r.pipeline_desc}")
-        lines.append(
-            f"    {'':<26} baseline: {r.baseline_label}"
-            f" | optimized: {r.optimized_label}"
-        )
-    # sweep details
-    for r in results:
-        if not r.sweep_detail:
-            continue
-        lines.append(f"\n  {r.rule_name} - Parameter Sweep:")
-        if "ratio" in r.sweep_detail[0]:
-            lines.extend(_fmt_sweep(r.sweep_detail, "ratio", "Ratio"))
-        elif "num_partitions" in r.sweep_detail[0]:
-            lines.extend(
-                _fmt_sweep(r.sweep_detail, "num_partitions", "N parts")
-            )
-    lines.append(f"\n{sep}")
-    return "\n".join(lines)
+END_TO_END_RUNNERS = {
+    "batch": run_batch_workload,
+    "streaming": run_streaming_workload,
+}
 
 
 
@@ -1054,6 +1328,86 @@ def main() -> None:
         "--validate-stats", action="store_true", default=False,
         help="Run CBO statistics infrastructure validation.",
     )
+    parser.add_argument(
+        "--r-value-matrix", action="store_true", default=False,
+        help="Run same-chain reservation-ratio matrix experiment.",
+    )
+    parser.add_argument(
+        "--memory-profile", action="store_true", default=False,
+        help="Run peak memory profiling experiment.",
+    )
+    parser.add_argument(
+        "--list-benchmarks", action="store_true", default=False,
+        help="Print the registered benchmark catalog and execution plan, then exit.",
+    )
+    parser.add_argument(
+        "--merge-results", action="store_true", default=False,
+        help="Merge existing benchmark JSON payloads without starting Ray.",
+    )
+    parser.add_argument(
+        "--input-results", type=str, default=None,
+        help="Comma-separated JSON result files to merge for --merge-results.",
+    )
+    parser.add_argument(
+        "--input-results-file", type=str, default=None,
+        help="JSON file containing a list of result files to merge for --merge-results.",
+    )
+    parser.add_argument(
+        "--merge-manifest", type=str, default=None,
+        help="Optional subtask manifest JSON used to validate merged shard coverage.",
+    )
+    parser.add_argument(
+        "--report-markdown", type=str, default=None,
+        help="Optional path to write a markdown benchmark report.",
+    )
+    parser.add_argument(
+        "--report-title", type=str, default=None,
+        help="Optional report title used by --report-markdown.",
+    )
+    parser.add_argument(
+        "--report-bundle-dir", type=str, default=None,
+        help="Optional output directory for the Phase5 publication bundle.",
+    )
+    parser.add_argument(
+        "--environment-metadata-json", type=str, default=None,
+        help="Optional JSON file with environment metadata merged into the publication bundle.",
+    )
+    parser.add_argument(
+        "--campaign-template-output", type=str, default=None,
+        help="Write a Phase6 campaign-spec template JSON, then exit.",
+    )
+    parser.add_argument(
+        "--campaign-spec", type=str, default=None,
+        help="Load a Phase6 campaign spec JSON.",
+    )
+    parser.add_argument(
+        "--campaign-plan-output", type=str, default=None,
+        help="Optional path to write the generated campaign plan JSON.",
+    )
+    parser.add_argument(
+        "--run-campaign", action="store_true", default=False,
+        help="Execute the task plan generated from --campaign-spec.",
+    )
+    parser.add_argument(
+        "--campaign-dry-run", action="store_true", default=False,
+        help="Print campaign commands without executing them.",
+    )
+    parser.add_argument(
+        "--no-campaign-resume", action="store_true", default=False,
+        help="Disable Phase6 skip-completed behavior when running a campaign.",
+    )
+    parser.add_argument(
+        "--feedback-alpha", type=float, default=0.7,
+        help="EMA alpha used by Phase4 runtime-feedback convergence analysis.",
+    )
+    parser.add_argument(
+        "--feedback-tolerance", type=float, default=0.02,
+        help="Convergence tolerance for Phase4 runtime-feedback analysis.",
+    )
+    parser.add_argument(
+        "--feedback-max-iterations", type=int, default=5,
+        help="Maximum feedback iterations simulated in Phase4 analysis.",
+    )
     # -- data scale --
     parser.add_argument(
         "--num-rows", type=int, default=200_000,
@@ -1067,10 +1421,62 @@ def main() -> None:
         "--streaming-rows", type=int, default=150_000,
         help="Row count for end-to-end streaming workload.",
     )
+    parser.add_argument(
+        "--matrix-row-scales", type=str, default="200000,500000",
+        help="Comma-separated row counts for the R-value matrix experiment.",
+    )
+    parser.add_argument(
+        "--matrix-operator-counts", type=str, default="2,4,6",
+        help="Comma-separated transform-operator counts for the R-value matrix experiment.",
+    )
+    parser.add_argument(
+        "--matrix-ratios", type=str, default="0.1,0.3,0.5,0.7,0.9",
+        help="Comma-separated reservation ratios to sweep in the R-value matrix experiment.",
+    )
+    parser.add_argument(
+        "--profile-row-scales", type=str, default="200000,500000",
+        help="Comma-separated row counts for the memory-profile experiment.",
+    )
+    parser.add_argument(
+        "--profile-operator-counts", type=str, default="2,4,6",
+        help="Comma-separated transform-operator counts for the memory-profile experiment.",
+    )
+    parser.add_argument(
+        "--payload-bytes-per-row", type=int, default=2048,
+        help="Synthetic payload size per row for the memory-profile experiment.",
+    )
+    parser.add_argument(
+        "--profile-preset", type=str, default=None,
+        help="Named memory-profile preset. Available: 10gb_10m.",
+    )
+    parser.add_argument(
+        "--memory-poll-interval-s", type=float, default=0.1,
+        help="Polling interval used to capture peak heap memory during memory profiling.",
+    )
     # -- execution --
     parser.add_argument(
         "--repetitions", type=int, default=3,
         help="How many times to repeat each configuration.",
+    )
+    parser.add_argument(
+        "--object-store-memory-bytes", type=int, default=None,
+        help="Optional object store memory override passed to ray.init().",
+    )
+    parser.add_argument(
+        "--ray-address", type=str, default="local",
+        help="Ray address passed to ray.init() (default: local).",
+    )
+    parser.add_argument(
+        "--subtask-count", type=int, default=1,
+        help="How many subtasks to split matrix/profile workloads into.",
+    )
+    parser.add_argument(
+        "--subtask-index", type=int, default=0,
+        help="Which subtask shard to execute.",
+    )
+    parser.add_argument(
+        "--subtask-manifest-output", type=str, default=None,
+        help="Optional path to write the computed subtask manifest JSON.",
     )
     parser.add_argument(
         "--warmup", action="store_true", default=False,
@@ -1082,6 +1488,207 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    selected_modes = sum(
+        1
+        for flag in (
+            args.per_rule,
+            args.r_value_matrix,
+            args.memory_profile,
+            args.merge_results,
+            bool(args.campaign_spec),
+        )
+        if flag
+    )
+    if selected_modes > 1:
+        parser.error(
+            "Choose at most one explicit mode among "
+            "--per-rule, --r-value-matrix, --memory-profile, --merge-results, --campaign-spec."
+        )
+    if args.feedback_alpha <= 0.0 or args.feedback_alpha > 1.0:
+        parser.error("--feedback-alpha must be within (0.0, 1.0].")
+    if args.feedback_tolerance < 0.0:
+        parser.error("--feedback-tolerance must be non-negative.")
+    if args.feedback_max_iterations < 0:
+        parser.error("--feedback-max-iterations must be non-negative.")
+    if args.merge_results and not (args.input_results or args.input_results_file):
+        parser.error("--merge-results requires --input-results or --input-results-file.")
+    if args.input_results and args.input_results_file:
+        parser.error("Use only one of --input-results or --input-results-file.")
+    if args.run_campaign and not args.campaign_spec:
+        parser.error("--run-campaign requires --campaign-spec.")
+    if args.campaign_dry_run and not args.run_campaign:
+        parser.error("--campaign-dry-run requires --run-campaign.")
+    environment_metadata = benchmark_postprocess.load_environment_metadata_file(
+        args.environment_metadata_json
+    )
+    if args.campaign_template_output:
+        benchmark_campaign.write_campaign_spec_template(args.campaign_template_output)
+        print(
+            "Campaign spec template written to "
+            f"{os.path.abspath(args.campaign_template_output)}"
+        )
+        return
+    if args.subtask_count < 1:
+        parser.error("--subtask-count must be positive.")
+    if args.subtask_index < 0 or args.subtask_index >= args.subtask_count:
+        parser.error("--subtask-index must be within [0, --subtask-count).")
+    if args.subtask_count > 1 and not (
+        args.r_value_matrix or args.memory_profile or args.list_benchmarks
+    ):
+        parser.error(
+            "Subtask splitting is currently supported for "
+            "--r-value-matrix, --memory-profile, or --list-benchmarks."
+        )
+    if args.campaign_spec:
+        campaign_spec = benchmark_campaign.load_campaign_spec_file(args.campaign_spec)
+        campaign_plan = benchmark_campaign.build_campaign_plan(campaign_spec)
+        campaign_plan_output = (
+            args.campaign_plan_output
+            or os.path.join(campaign_plan["output_dir"], "campaign_plan.json")
+        )
+        benchmark_campaign.write_campaign_plan(campaign_plan_output, campaign_plan)
+        print(benchmark_campaign.render_campaign_plan_summary(campaign_plan))
+        print(
+            "\nCampaign plan written to "
+            f"{os.path.abspath(campaign_plan_output)}"
+        )
+        if args.run_campaign:
+            campaign_result = benchmark_campaign.execute_campaign_plan(
+                campaign_plan,
+                resume=not args.no_campaign_resume,
+                dry_run=args.campaign_dry_run,
+            )
+            print(
+                "\nCampaign execution finished with "
+                f"{len(campaign_result['task_results'])} task result(s)"
+            )
+        return
+    if args.merge_results:
+        input_result_paths = (
+            _parse_str_list(args.input_results)
+            if args.input_results
+            else _load_str_list_file(args.input_results_file)
+        )
+        merged_payload = benchmark_postprocess.merge_benchmark_payload_files(
+            input_result_paths,
+            manifest_path=args.merge_manifest,
+            runtime_feedback_alpha=args.feedback_alpha,
+            runtime_feedback_tolerance=args.feedback_tolerance,
+            runtime_feedback_max_iterations=args.feedback_max_iterations,
+        )
+        _ensure_parent_dir(args.output)
+        with open(args.output, "w", encoding="utf-8") as fp:
+            json.dump(merged_payload, fp, indent=2)
+        print(f"\nMerged results written to {os.path.abspath(args.output)}")
+        if args.report_markdown:
+            _write_markdown_report(
+                args.report_markdown,
+                merged_payload,
+                args.report_title,
+                args.feedback_alpha,
+                args.feedback_tolerance,
+                args.feedback_max_iterations,
+            )
+            print(
+                "Markdown report written to "
+                f"{os.path.abspath(args.report_markdown)}"
+            )
+        if args.report_bundle_dir:
+            bundle_manifest = _write_publication_bundle(
+                args.report_bundle_dir,
+                merged_payload,
+                args.report_title,
+                environment_metadata,
+                input_result_paths,
+                args.merge_manifest,
+                args.feedback_alpha,
+                args.feedback_tolerance,
+                args.feedback_max_iterations,
+            )
+            print(
+                "Publication bundle written to "
+                f"{os.path.abspath(args.report_bundle_dir)}"
+            )
+            print(
+                "Bundle manifest written to "
+                f"{bundle_manifest['artifacts']['bundle_manifest_json']}"
+            )
+        return
+
+    if args.list_benchmarks:
+        matrix_rows = _parse_int_list(args.matrix_row_scales)
+        matrix_ops = _parse_int_list(args.matrix_operator_counts)
+        profile_inputs = _resolve_profile_inputs(args)
+        matrix_workloads = benchmark_harness.build_parameterized_workloads(
+            row_counts=matrix_rows,
+            operator_counts=matrix_ops,
+            payload_bytes_per_row=0,
+        )
+        memory_plan = benchmark_harness.build_memory_profile_plan(
+            row_counts=profile_inputs["row_counts"],
+            operator_counts=profile_inputs["operator_counts"],
+            repetitions=args.repetitions,
+            payload_bytes_per_row=profile_inputs["payload_bytes_per_row"],
+        )
+        plan = benchmark_harness.build_end_to_end_execution_plan(
+            batch_rows=args.batch_rows,
+            streaming_rows=args.streaming_rows,
+            repetitions=args.repetitions,
+        )
+        print(benchmark_harness.describe_rule_catalog(RULE_BENCHMARK_CASES))
+        print()
+        print(benchmark_harness.describe_end_to_end_plan(plan))
+        print()
+        print(
+            benchmark_harness.describe_parameterized_workloads(
+                matrix_workloads,
+                title="R-value matrix workload grid:",
+            )
+        )
+        print()
+        print(
+            benchmark_harness.describe_memory_profile_plan(memory_plan)
+        )
+        manifest_payload: Dict[str, Any] = {}
+        if args.subtask_count > 1:
+            matrix_manifest = benchmark_harness.build_parameterized_subtask_manifest(
+                matrix_workloads,
+                subtask_count=args.subtask_count,
+                experiment_type="r_value_matrix",
+            )
+            memory_manifest = benchmark_harness.build_memory_profile_subtask_manifest(
+                memory_plan,
+                subtask_count=args.subtask_count,
+            )
+            print()
+            print(
+                benchmark_harness.describe_subtask_manifest(
+                    matrix_manifest,
+                    title="R-value matrix subtask manifest:",
+                )
+            )
+            print()
+            print(
+                benchmark_harness.describe_subtask_manifest(
+                    memory_manifest,
+                    title="Memory-profile subtask manifest:",
+                )
+            )
+            manifest_payload = {
+                "r_value_matrix": [asdict(item) for item in matrix_manifest],
+                "memory_profile": [asdict(item) for item in memory_manifest],
+            }
+        if args.subtask_manifest_output:
+            _write_subtask_manifest(
+                args.subtask_manifest_output,
+                manifest_payload
+                or {
+                    "r_value_matrix": [],
+                    "memory_profile": [],
+                },
+            )
+        return
+
     # -- statistics validation (Part 1 does not need ray.init) --
     if args.validate_stats:
         try:
@@ -1089,10 +1696,18 @@ def main() -> None:
         except Exception as exc:
             print(f"\n  [WARN] Statistics validation skipped: {exc}")
 
-    ray.init(ignore_reinit_error=True)
+    ray_init_kwargs: Dict[str, Any] = {"ignore_reinit_error": True}
+    if args.ray_address:
+        ray_init_kwargs["address"] = args.ray_address
+    if args.object_store_memory_bytes is not None:
+        ray_init_kwargs["object_store_memory"] = args.object_store_memory_bytes
+    ray.init(**ray_init_kwargs)
 
-    rule_results: Optional[List[RuleBenchResult]] = None
-    e2e_runs: List[RunMetrics] = []
+    rule_results: Optional[List[benchmark_harness.RuleBenchResult]] = None
+    e2e_runs: List[benchmark_harness.RunMetrics] = []
+    matrix_results: Optional[List[benchmark_harness.RValueMatrixResult]] = None
+    memory_profile_runs: Optional[List[benchmark_harness.RunMetrics]] = None
+    payload_config: Dict[str, Any] = {}
 
     try:
         if args.validate_stats:
@@ -1109,12 +1724,110 @@ def main() -> None:
                 [r.strip() for r in args.rules.split(",")]
                 if args.rules else None
             )
-            rule_results = run_per_rule_benchmarks(
-                num_rows=args.num_rows,
-                reps=args.repetitions,
-                warmup=args.warmup,
-                rules=rule_list,
+            selected_cases = benchmark_harness.select_rule_benchmark_cases(
+                RULE_BENCHMARK_CASES,
+                rule_list,
             )
+            if args.warmup:
+                print("\n[warmup] Running warmup pipeline ...")
+                ray.data.range(min(args.num_rows, 50_000)).map_batches(
+                    lambda b: b, batch_format="numpy",
+                ).materialize()
+                print("[warmup] Done.\n")
+
+            rule_results = []
+            for case in selected_cases:
+                try:
+                    result = benchmark_harness.run_rule_benchmark_suite(
+                        [case],
+                        num_rows=args.num_rows,
+                        repetitions=args.repetitions,
+                    )
+                    rule_results.extend(result)
+                except Exception as exc:
+                    print(f"  [{case.name}] FAILED: {exc}")
+        elif args.r_value_matrix:
+            matrix_workloads = benchmark_harness.build_parameterized_workloads(
+                row_counts=_parse_int_list(args.matrix_row_scales),
+                operator_counts=_parse_int_list(args.matrix_operator_counts),
+                payload_bytes_per_row=0,
+            )
+            matrix_manifest = benchmark_harness.build_parameterized_subtask_manifest(
+                matrix_workloads,
+                subtask_count=args.subtask_count,
+                experiment_type="r_value_matrix",
+            )
+            if args.subtask_manifest_output:
+                _write_subtask_manifest(
+                    args.subtask_manifest_output,
+                    {"r_value_matrix": [asdict(item) for item in matrix_manifest]},
+                )
+            selected_workloads = benchmark_harness.shard_parameterized_workloads(
+                matrix_workloads,
+                subtask_index=args.subtask_index,
+                subtask_count=args.subtask_count,
+            )
+            matrix_results = run_r_value_matrix_experiment(
+                workloads=selected_workloads,
+                sweep_ratios=_parse_float_list(args.matrix_ratios),
+                repetitions=args.repetitions,
+                subtask_index=args.subtask_index,
+                subtask_count=args.subtask_count,
+            )
+            payload_config = {
+                "row_scales": _parse_int_list(args.matrix_row_scales),
+                "operator_counts": _parse_int_list(args.matrix_operator_counts),
+                "sweep_ratios": _parse_float_list(args.matrix_ratios),
+                "repetitions": args.repetitions,
+                "subtask_index": args.subtask_index,
+                "subtask_count": args.subtask_count,
+                "selected_workload_ids": [
+                    workload.workload_id for workload in selected_workloads
+                ],
+            }
+        elif args.memory_profile:
+            profile_inputs = _resolve_profile_inputs(args)
+            memory_plan = benchmark_harness.build_memory_profile_plan(
+                row_counts=profile_inputs["row_counts"],
+                operator_counts=profile_inputs["operator_counts"],
+                repetitions=args.repetitions,
+                payload_bytes_per_row=profile_inputs["payload_bytes_per_row"],
+            )
+            memory_manifest = benchmark_harness.build_memory_profile_subtask_manifest(
+                memory_plan,
+                subtask_count=args.subtask_count,
+            )
+            if args.subtask_manifest_output:
+                _write_subtask_manifest(
+                    args.subtask_manifest_output,
+                    {"memory_profile": [asdict(item) for item in memory_manifest]},
+                )
+            selected_plan = benchmark_harness.shard_memory_profile_plan(
+                memory_plan,
+                subtask_index=args.subtask_index,
+                subtask_count=args.subtask_count,
+            )
+            memory_profile_runs = run_memory_profile_experiment(
+                plan=selected_plan,
+                repetitions=args.repetitions,
+                memory_poll_interval_s=args.memory_poll_interval_s,
+                subtask_index=args.subtask_index,
+                subtask_count=args.subtask_count,
+                preset_name=profile_inputs["preset_name"],
+            )
+            payload_config = {
+                "row_scales": profile_inputs["row_counts"],
+                "operator_counts": profile_inputs["operator_counts"],
+                "payload_bytes_per_row": profile_inputs["payload_bytes_per_row"],
+                "memory_poll_interval_s": args.memory_poll_interval_s,
+                "repetitions": args.repetitions,
+                "profile_preset": profile_inputs["preset_name"],
+                "target_total_bytes": profile_inputs.get("target_total_bytes"),
+                "target_rows": profile_inputs.get("target_rows"),
+                "subtask_index": args.subtask_index,
+                "subtask_count": args.subtask_count,
+                "selected_run_ids": [case.run_id for case in selected_plan],
+            }
         else:
             # -- end-to-end comparison mode --
             if args.warmup:
@@ -1126,56 +1839,101 @@ def main() -> None:
                     min(args.streaming_rows, 50_000), enable_cbo=False,
                 )
                 print("[warmup] Done.\n")
-
-            for rep in range(args.repetitions):
-                print(f"[rep {rep+1}/{args.repetitions}] batch CBO=OFF ...")
-                e2e_runs.append(
-                    run_batch_workload(args.batch_rows, enable_cbo=False)
-                )
-                print(f"[rep {rep+1}/{args.repetitions}] batch CBO=ON ...")
-                e2e_runs.append(
-                    run_batch_workload(args.batch_rows, enable_cbo=True)
-                )
-                print(f"[rep {rep+1}/{args.repetitions}] streaming CBO=OFF")
-                e2e_runs.append(
-                    run_streaming_workload(
-                        args.streaming_rows, enable_cbo=False,
-                    )
-                )
-                print(f"[rep {rep+1}/{args.repetitions}] streaming CBO=ON")
-                e2e_runs.append(
-                    run_streaming_workload(
-                        args.streaming_rows, enable_cbo=True,
-                    )
-                )
+            execution_plan = benchmark_harness.build_end_to_end_execution_plan(
+                batch_rows=args.batch_rows,
+                streaming_rows=args.streaming_rows,
+                repetitions=args.repetitions,
+            )
+            e2e_runs = benchmark_harness.execute_end_to_end_plan(
+                execution_plan,
+                END_TO_END_RUNNERS,
+                repetitions=args.repetitions,
+            )
     finally:
         ray.shutdown()
 
     # -- reporting (does not need Ray) --
     if rule_results is not None:
-        print(format_rule_results_table(
-            rule_results, args.num_rows, args.repetitions,
-        ))
-        payload: Dict[str, Any] = {
-            "mode": "per-rule",
-            "config": {
+        print(
+            benchmark_harness.format_rule_results_table(
+                rule_results, args.num_rows, args.repetitions,
+            )
+        )
+        payload = build_per_rule_payload(
+            [asdict(r) for r in rule_results],
+            {
                 "num_rows": args.num_rows,
                 "repetitions": args.repetitions,
             },
-            "results": [asdict(r) for r in rule_results],
-        }
+        )
+    elif matrix_results is not None:
+        print(benchmark_harness.format_r_value_matrix_table(matrix_results))
+        payload = build_r_value_matrix_payload(
+            [asdict(result) for result in matrix_results],
+            payload_config,
+        )
+    elif memory_profile_runs is not None:
+        print(benchmark_harness.format_memory_profile_table(memory_profile_runs))
+        payload = build_memory_profile_payload(
+            [asdict(run) for run in memory_profile_runs],
+            payload_config,
+        )
     else:
-        aggregates = aggregate_runs(e2e_runs)
-        print(_format_comparison(aggregates))
-        payload = {
-            "mode": "end-to-end",
-            "runs": [asdict(r) for r in e2e_runs],
-            "aggregates": aggregates,
-        }
+        aggregates = benchmark_harness.aggregate_runs(e2e_runs)
+        print(benchmark_harness.format_end_to_end_comparison(aggregates))
+        payload = build_end_to_end_payload(
+            [asdict(r) for r in e2e_runs],
+            aggregates,
+            {
+                "batch_rows": args.batch_rows,
+                "streaming_rows": args.streaming_rows,
+                "repetitions": args.repetitions,
+            },
+        )
 
+    if not payload["validation"]["is_valid"]:
+        raise ValueError(
+            "Benchmark output payload failed validation: "
+            + "; ".join(payload["validation"]["errors"])
+        )
+
+    _ensure_parent_dir(args.output)
     with open(args.output, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, indent=2)
     print(f"\nFull results written to {os.path.abspath(args.output)}")
+    if args.report_markdown:
+        _write_markdown_report(
+            args.report_markdown,
+            payload,
+            args.report_title,
+            args.feedback_alpha,
+            args.feedback_tolerance,
+            args.feedback_max_iterations,
+        )
+        print(
+            "Markdown report written to "
+            f"{os.path.abspath(args.report_markdown)}"
+        )
+    if args.report_bundle_dir:
+        bundle_manifest = _write_publication_bundle(
+            args.report_bundle_dir,
+            payload,
+            args.report_title,
+            environment_metadata,
+            [os.path.abspath(args.output)],
+            None,
+            args.feedback_alpha,
+            args.feedback_tolerance,
+            args.feedback_max_iterations,
+        )
+        print(
+            "Publication bundle written to "
+            f"{os.path.abspath(args.report_bundle_dir)}"
+        )
+        print(
+            "Bundle manifest written to "
+            f"{bundle_manifest['artifacts']['bundle_manifest_json']}"
+        )
 
 
 if __name__ == "__main__":
