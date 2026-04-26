@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -70,6 +71,7 @@ def build_campaign_spec_template() -> Dict[str, Any]:
             "local_max_parallelism": 1,
             "allow_local_fallback_for_remote_stages": True,
             "state_path": "./cbo_campaign_output/execution_state.json",
+            "targets": [],
             "remote_targets": [],
         },
         "experiments": {
@@ -169,26 +171,88 @@ def _normalize_executor_config(
     )
     if max_parallelism <= 0 or local_max_parallelism <= 0:
         raise ValueError("executor parallelism values must be positive")
-    remote_targets: List[Dict[str, Any]] = []
-    for index, target in enumerate(raw_executor.get("remote_targets") or []):
+    raw_targets = raw_executor.get("targets")
+    if raw_targets is None:
+        raw_targets = raw_executor.get("remote_targets") or []
+    targets: List[Dict[str, Any]] = []
+    for index, target in enumerate(raw_targets):
         if not isinstance(target, dict):
-            raise ValueError("executor.remote_targets entries must be objects")
+            raise ValueError("executor.targets entries must be objects")
         name = str(target.get("name") or f"remote-{index}")
         capacity = int(target.get("capacity", 1))
         if capacity <= 0:
-            raise ValueError(f"executor.remote_targets[{index}].capacity must be positive")
-        command_template = target.get("command_template") or []
-        if not isinstance(command_template, list) or not command_template:
-            raise ValueError(
-                f"executor.remote_targets[{index}].command_template must be a non-empty list"
-            )
+            raise ValueError(f"executor.targets[{index}].capacity must be positive")
         stages = [str(stage) for stage in (target.get("stages") or ["run_shard"])]
-        remote_targets.append(
+        backend = dict(target.get("backend") or {})
+        if not backend and target.get("command_template"):
+            backend = {
+                "type": "template",
+                "command_template": list(target["command_template"]),
+            }
+        backend_type = str(backend.get("type") or "local")
+        normalized_backend: Dict[str, Any] = {"type": backend_type}
+        if backend_type == "local":
+            pass
+        elif backend_type == "template":
+            command_template = backend.get("command_template") or []
+            if not isinstance(command_template, list) or not command_template:
+                raise ValueError(
+                    f"executor.targets[{index}].backend.command_template must be a non-empty list"
+                )
+            normalized_backend["command_template"] = [str(part) for part in command_template]
+        elif backend_type == "ssh":
+            if not backend.get("host"):
+                raise ValueError(f"executor.targets[{index}].backend.host is required")
+            normalized_backend.update(
+                {
+                    "host": str(backend["host"]),
+                    "ssh_binary": str(backend.get("ssh_binary", "ssh")),
+                    "ssh_args": [str(arg) for arg in (backend.get("ssh_args") or [])],
+                    "remote_working_dir": backend.get("remote_working_dir"),
+                }
+            )
+        elif backend_type == "ray_job":
+            if not backend.get("address"):
+                raise ValueError(f"executor.targets[{index}].backend.address is required")
+            normalized_backend.update(
+                {
+                    "address": str(backend["address"]),
+                    "ray_binary": str(backend.get("ray_binary", "ray")),
+                    "working_dir": backend.get("working_dir"),
+                    "job_working_dir": backend.get("job_working_dir"),
+                    "runtime_env_json": backend.get("runtime_env_json"),
+                    "submission_id_prefix": str(
+                        backend.get("submission_id_prefix", "cbo-bench")
+                    ),
+                }
+            )
+        elif backend_type == "k8s_job":
+            if not backend.get("image"):
+                raise ValueError(f"executor.targets[{index}].backend.image is required")
+            normalized_backend.update(
+                {
+                    "image": str(backend["image"]),
+                    "kubectl_binary": str(backend.get("kubectl_binary", "kubectl")),
+                    "namespace": backend.get("namespace"),
+                    "job_name_prefix": str(
+                        backend.get("job_name_prefix", "cbo-bench")
+                    ),
+                    "container_working_dir": backend.get("container_working_dir"),
+                    "wait_for_completion": bool(
+                        backend.get("wait_for_completion", True)
+                    ),
+                    "timeout": str(backend.get("timeout", "3600s")),
+                    "cleanup": bool(backend.get("cleanup", False)),
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported executor backend type: {backend_type}")
+        targets.append(
             {
                 "name": name,
                 "capacity": capacity,
                 "stages": stages,
-                "command_template": [str(part) for part in command_template],
+                "backend": normalized_backend,
             }
         )
 
@@ -203,7 +267,7 @@ def _normalize_executor_config(
         "allow_local_fallback_for_remote_stages": bool(
             raw_executor.get("allow_local_fallback_for_remote_stages", True)
         ),
-        "remote_targets": remote_targets,
+        "targets": targets,
         "state_path": state_path,
     }
 
@@ -741,7 +805,7 @@ def render_campaign_plan_summary(plan: Dict[str, Any]) -> str:
             "Executor: "
             f"max_parallelism={executor.get('max_parallelism', 1)}, "
             f"local_max_parallelism={executor.get('local_max_parallelism', 1)}, "
-            f"remote_targets={len(executor.get('remote_targets') or [])}"
+            f"targets={len(executor.get('targets') or [])}"
         ),
         "Tasks:",
     ]
@@ -754,7 +818,20 @@ def render_campaign_plan_summary(plan: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_wrapped_command(
+def _slugify_identifier(value: str, max_length: int = 48) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9-]+", "-", value).strip("-").lower()
+    slug = slug or "task"
+    return slug[:max_length].rstrip("-") or "task"
+
+
+def _render_shell_command(task_command: Sequence[str], cwd: Optional[str]) -> str:
+    rendered = shlex.join(list(task_command))
+    if cwd:
+        return f"cd {shlex.quote(cwd)} && {rendered}"
+    return rendered
+
+
+def build_backend_command(
     task: Dict[str, Any],
     target: Optional[Dict[str, Any]],
 ) -> Tuple[List[str], str]:
@@ -762,30 +839,121 @@ def _format_wrapped_command(
         command = list(task["command"])
         return command, shlex.join(command)
 
-    rendered_command = shlex.join(task["command"])
+    backend = dict(target.get("backend") or {})
+    backend_type = str(backend.get("type") or "local")
+    command = list(task["command"])
     cwd = task.get("cwd") or os.getcwd()
-    substitutions = {
-        "command": rendered_command,
-        "cwd": cwd,
-        "task_id": task["task_id"],
-        "output_path": task["output_path"],
-        "log_path": task["log_path"],
-        "target_name": target["name"],
-    }
-    command_template = list(target["command_template"])
-    has_placeholder = any("{" in part and "}" in part for part in command_template)
-    if has_placeholder:
-        formatted = [part.format(**substitutions) for part in command_template]
-        return formatted, shlex.join(formatted)
-    wrapped = command_template + list(task["command"])
-    return wrapped, shlex.join(wrapped)
-
-
-def _stage_has_remote_target(executor: Dict[str, Any], stage: str) -> bool:
-    for target in executor.get("remote_targets") or []:
-        if stage in (target.get("stages") or []):
-            return True
-    return False
+    if backend_type == "local":
+        return command, shlex.join(command)
+    if backend_type == "template":
+        rendered_command = shlex.join(command)
+        substitutions = {
+            "command": rendered_command,
+            "cwd": cwd,
+            "task_id": task["task_id"],
+            "output_path": task["output_path"],
+            "log_path": task["log_path"],
+            "target_name": target["name"],
+        }
+        command_template = list(backend["command_template"])
+        has_placeholder = any("{" in part and "}" in part for part in command_template)
+        if has_placeholder:
+            formatted = [part.format(**substitutions) for part in command_template]
+            return formatted, shlex.join(formatted)
+        wrapped = command_template + command
+        return wrapped, shlex.join(wrapped)
+    if backend_type == "ssh":
+        remote_command = _render_shell_command(
+            command,
+            str(backend.get("remote_working_dir") or cwd),
+        )
+        wrapped = [
+            backend.get("ssh_binary", "ssh"),
+            *list(backend.get("ssh_args") or []),
+            backend["host"],
+            remote_command,
+        ]
+        return wrapped, shlex.join(wrapped)
+    if backend_type == "ray_job":
+        submission_id = (
+            f"{backend.get('submission_id_prefix', 'cbo-bench')}-"
+            f"{_slugify_identifier(task['task_id'])}"
+        )
+        wrapped = [
+            backend.get("ray_binary", "ray"),
+            "job",
+            "submit",
+            "--address",
+            backend["address"],
+            "--submission-id",
+            submission_id,
+        ]
+        if backend.get("working_dir"):
+            wrapped.extend(["--working-dir", str(backend["working_dir"])])
+        if backend.get("runtime_env_json"):
+            wrapped.extend(["--runtime-env-json", str(backend["runtime_env_json"])])
+        wrapped.extend(
+            [
+                "--",
+                "sh",
+                "-lc",
+                _render_shell_command(
+                    command,
+                    str(backend.get("job_working_dir") or cwd),
+                ),
+            ]
+        )
+        return wrapped, shlex.join(wrapped)
+    if backend_type == "k8s_job":
+        kubectl_binary = backend.get("kubectl_binary", "kubectl")
+        job_name = (
+            f"{backend.get('job_name_prefix', 'cbo-bench')}-"
+            f"{_slugify_identifier(task['task_id'], max_length=40)}"
+        )[:63].rstrip("-")
+        namespace = backend.get("namespace")
+        create_cmd = [
+            kubectl_binary,
+            "create",
+            "job",
+            job_name,
+            "--image",
+            backend["image"],
+        ]
+        if namespace:
+            create_cmd.extend(["--namespace", str(namespace)])
+        create_cmd.extend(
+            [
+                "--",
+                "sh",
+                "-lc",
+                _render_shell_command(
+                    command,
+                    str(backend.get("container_working_dir") or cwd),
+                ),
+            ]
+        )
+        if not backend.get("wait_for_completion", True):
+            return create_cmd, shlex.join(create_cmd)
+        wait_cmd = [
+            kubectl_binary,
+            "wait",
+            f"job/{job_name}",
+            "--for=condition=complete",
+            f"--timeout={backend.get('timeout', '3600s')}",
+        ]
+        logs_cmd = [kubectl_binary, "logs", f"job/{job_name}"]
+        if namespace:
+            wait_cmd.extend(["--namespace", str(namespace)])
+            logs_cmd.extend(["--namespace", str(namespace)])
+        chained = [shlex.join(create_cmd), shlex.join(wait_cmd), shlex.join(logs_cmd)]
+        if backend.get("cleanup", False):
+            delete_cmd = [kubectl_binary, "delete", "job", job_name]
+            if namespace:
+                delete_cmd.extend(["--namespace", str(namespace)])
+            chained.append(shlex.join(delete_cmd))
+        wrapped = ["sh", "-lc", " && ".join(chained)]
+        return wrapped, shlex.join(wrapped)
+    raise ValueError(f"Unsupported backend type: {backend_type}")
 
 
 def _select_dispatch_target(
@@ -796,18 +964,18 @@ def _select_dispatch_target(
     round_robin_state: Dict[str, int],
 ) -> Optional[Dict[str, Any]]:
     stage = task["stage"]
-    remote_targets = [
+    configured_targets = [
         target
-        for target in (executor.get("remote_targets") or [])
+        for target in (executor.get("targets") or [])
         if stage in (target.get("stages") or [])
     ]
-    if remote_targets:
+    if configured_targets:
         start = round_robin_state.get(stage, 0)
-        for offset in range(len(remote_targets)):
-            index = (start + offset) % len(remote_targets)
-            target = remote_targets[index]
+        for offset in range(len(configured_targets)):
+            index = (start + offset) % len(configured_targets)
+            target = configured_targets[index]
             if active_remote.get(target["name"], 0) < int(target["capacity"]):
-                round_robin_state[stage] = (index + 1) % len(remote_targets)
+                round_robin_state[stage] = (index + 1) % len(configured_targets)
                 return target
         if not executor.get("allow_local_fallback_for_remote_stages", True):
             return None
@@ -817,7 +985,7 @@ def _select_dispatch_target(
             "name": "local",
             "capacity": int(executor.get("local_max_parallelism", 1)),
             "stages": [],
-            "command_template": [],
+            "backend": {"type": "local"},
         }
     return None
 
@@ -857,7 +1025,7 @@ def _run_campaign_task(
     task: Dict[str, Any],
     target: Dict[str, Any],
 ) -> Dict[str, Any]:
-    command, launched_command = _format_wrapped_command(
+    command, launched_command = build_backend_command(
         task,
         None if target.get("name") == "local" else target,
     )
@@ -889,7 +1057,7 @@ def execute_campaign_plan(
     executor = plan.get("executor") or {
         "max_parallelism": 1,
         "local_max_parallelism": 1,
-        "remote_targets": [],
+        "targets": [],
         "allow_local_fallback_for_remote_stages": True,
         "state_path": os.path.join(plan["output_dir"], "execution_state.json"),
     }
@@ -953,7 +1121,7 @@ def execute_campaign_plan(
                     continue
 
                 if dry_run:
-                    display_command = _format_wrapped_command(task, None)[1]
+                    display_command = build_backend_command(task, None)[1]
                     log_fn(f"[dry-run] {task['task_id']}: {display_command}")
                     task_results.append(
                         {
@@ -991,7 +1159,7 @@ def execute_campaign_plan(
                     active_remote[dispatch_target["name"]] = (
                         active_remote.get(dispatch_target["name"], 0) + 1
                     )
-                launch_preview = _format_wrapped_command(
+                launch_preview = build_backend_command(
                     task,
                     None if dispatch_target["name"] == "local" else dispatch_target,
                 )[1]
